@@ -1,7 +1,7 @@
 import { resolveDynamicFoir } from "./policyMatrix";
 
 export const DEFAULT_FOIR_PERCENT = 70;
-export const DEFAULT_CREDIT_CARD_OBLIGATION_PERCENT = 2;
+export const DEFAULT_CREDIT_CARD_OBLIGATION_PERCENT = 5;
 export const LOAN_UNIT = 100000;
 
 export function round2(value: number): number {

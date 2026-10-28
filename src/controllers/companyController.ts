@@ -5,8 +5,19 @@ const companyService = require("../services/companyService");
 const { getDynamicFoirFromDb } = require("../services/policyMatrixService");
 const { resolveDynamicFoir } = require("../helpers/policyMatrix");
 const { resolveBreFoir } = require("../services/breService");
-const { lookupPincode } = require("../services/pincodeService");
+const { lookupPincode, isBankServiceableForPincode } = require("../services/pincodeService");
 const { categoryMatches } = require("../utils/categoryMatcher");
+
+function sortLendersByFoirDesc(a, b) {
+    const foirA = Number(a && a.foir) || 0;
+    const foirB = Number(b && b.foir) || 0;
+    if (foirB !== foirA) {
+        return foirB - foirA; // High to Low based on FOIR %
+    }
+    const nameA = String(a && a.bank_name || "").toUpperCase();
+    const nameB = String(b && b.bank_name || "").toUpperCase();
+    return nameA.localeCompare(nameB);
+}
 
 async function evaluateFinnableLender(companyName, salary, pincode, enquiries30d, pool) {
     if (salary < 15000) return null;
@@ -53,7 +64,7 @@ async function evaluateFinnableLender(companyName, salary, pincode, enquiries30d
         cat: breCat,
         foir: foirVal,
         salary_slab: slabVal,
-        cc_obligation_percent: 2,
+        cc_obligation_percent: 5,
         is_finnable: true,
         low_salary_eligible: true,
         tier: tier,
@@ -139,7 +150,7 @@ async function evaluateCatalogFreeLenders(companyName, salary, knownCategories =
                     cat: targetCategory,
                     foir: breResult.foir_percent,
                     salary_slab: breResult.rule_name,
-                    cc_obligation_percent: 2,
+                    cc_obligation_percent: 5,
                     is_open_market: true
                 });
             }
@@ -257,18 +268,16 @@ function createCompanyController(state) {
                         cat: m.cat,
                         foir: dynamicMatrix.foir,
                         salary_slab: dynamicMatrix.salarySlab,
-                        cc_obligation_percent: 2
+                        cc_obligation_percent: 5
                     };
                 });
 
                 const finnableDemo = await evaluateFinnableLender(companyName, salary, pincode, enquiries30d, null);
                 if (finnableDemo) {
-                    if (salary < 25000) {
-                        demoList.unshift(finnableDemo);
-                    } else {
-                        demoList.push(finnableDemo);
-                    }
+                    demoList.push(finnableDemo);
                 }
+
+                demoList.sort(sortLendersByFoirDesc);
 
                 if (demoList.length === 0) {
                     return res.status(404).json({
@@ -291,9 +300,25 @@ function createCompanyController(state) {
                 const catalogFreeLenders = await evaluateCatalogFreeLenders(companyName, salary, knownCategories, pool, hasHomeLoan);
 
                 if (result.rows.length === 0) {
-                    const fallbackLenders = [];
+                    let fallbackLenders = [];
                     if (finnableLender) fallbackLenders.push(finnableLender);
                     if (catalogFreeLenders && catalogFreeLenders.length > 0) fallbackLenders.push(...catalogFreeLenders);
+
+                    const cleanPin = String(pincode || "").trim().replace(/\D/g, "");
+                    if (cleanPin.length === 6) {
+                        const filtered = [];
+                        for (const m of fallbackLenders) {
+                            if (m.is_finnable || (m.bank_name && m.bank_name.toUpperCase().includes("FINNABLE"))) {
+                                filtered.push(m);
+                                continue;
+                            }
+                            const isServ = await isBankServiceableForPincode(m.bank_name, cleanPin);
+                            if (isServ) filtered.push(m);
+                        }
+                        fallbackLenders = filtered;
+                    }
+
+                    fallbackLenders.sort(sortLendersByFoirDesc);
 
                     if (fallbackLenders.length > 0) {
                         return res.json({
@@ -325,7 +350,7 @@ function createCompanyController(state) {
                                 cat: row.cat,
                                 foir: breResult.foir_percent,
                                 salary_slab: breResult.rule_name,
-                                cc_obligation_percent: Number(row.cc_obligation_percent || 2)
+                                cc_obligation_percent: Number(row.cc_obligation_percent || 5)
                             };
                         }
 
@@ -337,7 +362,7 @@ function createCompanyController(state) {
                             cat: row.cat,
                             foir: dynamicMatrix.foir,
                             salary_slab: dynamicMatrix.salarySlab,
-                            cc_obligation_percent: Number(row.cc_obligation_percent || 2)
+                            cc_obligation_percent: Number(row.cc_obligation_percent || 5)
                         };
                     })
                 );
@@ -357,17 +382,33 @@ function createCompanyController(state) {
                     const existingIndex = mappingsWithFoir.findIndex(m => m.bank_name.toLowerCase().includes("finnable"));
                     if (existingIndex >= 0) {
                         mappingsWithFoir[existingIndex] = { ...mappingsWithFoir[existingIndex], ...finnableLender };
-                    } else if (salary < 25000) {
-                        mappingsWithFoir.unshift(finnableLender);
                     } else {
                         mappingsWithFoir.push(finnableLender);
                     }
                 }
 
+                let finalMappings = mappingsWithFoir;
+                const cleanPin = String(pincode || "").trim().replace(/\D/g, "");
+                if (cleanPin.length === 6) {
+                    const filtered = [];
+                    for (const m of mappingsWithFoir) {
+                        if (m.is_finnable || (m.bank_name && m.bank_name.toUpperCase().includes("FINNABLE"))) {
+                            filtered.push(m);
+                            continue;
+                        }
+                        const isServ = await isBankServiceableForPincode(m.bank_name, cleanPin);
+                        if (isServ) filtered.push(m);
+                    }
+                    finalMappings = filtered;
+                }
+
+                // Sort High to Low based on FOIR %
+                finalMappings.sort(sortLendersByFoirDesc);
+
                 return res.json({
                     success: true,
                     company_name: result.rows[0].company_name,
-                    mappings: mappingsWithFoir
+                    mappings: finalMappings
                 });
             } catch (error) {
                 console.error("Company mappings error:", error.message);

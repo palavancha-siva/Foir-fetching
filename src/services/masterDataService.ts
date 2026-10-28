@@ -887,7 +887,7 @@ async function listBankMappings(bankIdentifier, pool, options = {}) {
             bank_name: row.bank_name,
             cat: row.cat,
             foir: hasBre ? (breMinFoir === breMaxFoir ? breMinFoir : fallbackFoir) : fallbackFoir,
-            cc_obligation_percent: Number(row.cc_obligation_percent ?? 2),
+            cc_obligation_percent: Number(row.cc_obligation_percent ?? 5),
             bre_configured: hasBre,
             bre_min_foir: breMinFoir,
             bre_max_foir: breMaxFoir,
@@ -905,7 +905,7 @@ async function addCompanyToBankMapping(bankIdentifier, values, pool) {
             bank_name: bankName,
             cat: values.cat,
             foir: Number(values.foir),
-            cc_obligation_percent: Number(values.cc_obligation_percent ?? 2)
+            cc_obligation_percent: Number(values.cc_obligation_percent ?? 5)
         };
     }
     if (/^\d+$/.test(bankName)) {

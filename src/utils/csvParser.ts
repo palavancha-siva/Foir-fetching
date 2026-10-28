@@ -244,7 +244,7 @@ export function normalizeCsvRow(row: any, defaultBank: string = ""): NormalizedC
         company_name: sanitizeCsvValue(companyName),
         cat: rawCategory ? sanitizeCsvValue(rawCategory) : null,
         foir: rawFoir !== undefined && rawFoir !== "" ? Number(String(rawFoir).replace("%", "").trim()) : 70,
-        cc_obligation_percent: rawCc !== undefined && rawCc !== "" ? Number(String(rawCc).replace("%", "").trim()) : 2
+        cc_obligation_percent: rawCc !== undefined && rawCc !== "" ? Number(String(rawCc).replace("%", "").trim()) : 5
     };
 }
 

@@ -351,6 +351,9 @@ function createPincodeController(state) {
                     });
                 }
 
+                const defaultState = String(req.body.defaultState || req.body.state || req.body.targetState || "").trim();
+                const hasDefaultState = Boolean(defaultState && defaultState.toLowerCase() !== "auto");
+
                 const pinMap = new Map();
                 for (const row of rawRows) {
                     const pin = String(row.pincode || row.pin || row.pin_code || row.postal_code || "").trim().replace(/\D/g, "");
@@ -378,14 +381,19 @@ function createPincodeController(state) {
                         location
                     ).trim().replace(/\s+Region$/i, "").slice(0, 140);
 
-                    let state = String(
+                    const rawState = String(
                         row.state ||
                         row.statename ||
                         row.state_name ||
                         row.circle ||
                         row.circlename ||
-                        "Telangana"
+                        ""
                     ).trim().replace(/\s+Circle$/i, "").slice(0, 95);
+
+                    let state = rawState;
+                    if (!state || state.toLowerCase() === "unknown") {
+                        state = hasDefaultState ? defaultState : "Telangana";
+                    }
 
                     if ((!location || location === "Unknown") && row.division) {
                         location = String(row.division).replace(/\s+Division$/i, "").trim().slice(0, 140);

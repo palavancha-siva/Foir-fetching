@@ -167,7 +167,7 @@ function createCompanyController(state) {
     return {
         async search(req, res) {
             const search = String(req.query.search || req.query.q || req.query.query || "").trim();
-            if (search.length < 2) return res.json([]);
+            if (search.length < 1) return res.json([]);
 
             const pool = state.getPool();
             if (!pool) {
@@ -184,7 +184,22 @@ function createCompanyController(state) {
                     { id: 10, name: "Microsoft" },
                     { id: 11, name: "IBM" }
                 ];
-                return res.json(demoCompanies.filter(c => c.name.toLowerCase().includes(search.toLowerCase())));
+                const clean = search.toLowerCase();
+                const filtered = demoCompanies.filter(c => c.name.toLowerCase().includes(clean));
+                filtered.sort((a, b) => {
+                    const rank = (name) => {
+                        const n = name.toLowerCase();
+                        if (n === clean) return 1;
+                        if (n.startsWith(clean)) return 2;
+                        if (n.includes(` ${clean}`) || n.includes(`(${clean}`) || n.includes(`/${clean}`) || n.includes(`-${clean}`)) return 3;
+                        return 4;
+                    };
+                    const diff = rank(a.name) - rank(b.name);
+                    if (diff !== 0) return diff;
+                    if (a.name.length !== b.name.length) return a.name.length - b.name.length;
+                    return a.name.localeCompare(b.name);
+                });
+                return res.json(filtered);
             }
 
             try {

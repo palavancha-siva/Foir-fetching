@@ -96,10 +96,12 @@ export function calculateFoir({
                 ? parsedCardObligationPercent
                 : DEFAULT_CREDIT_CARD_OBLIGATION_PERCENT;
         const creditCardObligations = sum(
-            creditCards.map((card: any) =>
-                (Number(card.outstanding) || 0) *
-                cardObligationPercent / 100
-            )
+            creditCards
+                .filter((card: any) => !card.balanceTransfer)
+                .map((card: any) =>
+                    (Number(card.outstanding) || 0) *
+                    cardObligationPercent / 100
+                )
         );
         const totalObligations = round2(
             loanEmis + creditCardObligations

@@ -16,7 +16,7 @@ async function bootstrap() {
         logger.warn(`PostgreSQL connection failed: ${err.message}. Running in fallback mode.`);
     }
 
-    const port = activeOptions?.port || 5104;
+    const port = activeOptions?.port || 5105;
     const server = expressApp.listen(port, () => {
         logger.info(`=======================================================`);
         logger.info(`fin_crm_app running on http://localhost:${port}`);

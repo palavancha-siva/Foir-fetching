@@ -21,10 +21,10 @@ export class LoanEligibilityService {
         // If no lender mappings exist for company, query default bank configurations
         if (lenderMappings.length === 0) {
             lenderMappings = [
-                { bankName: "HDFC Bank", category: "CAT A", foir: 70, ccObligationPercent: 2 },
-                { bankName: "ICICI Bank", category: "CAT B", foir: 65, ccObligationPercent: 2 },
-                { bankName: "Axis Bank", category: "CAT C", foir: 60, ccObligationPercent: 2 },
-                { bankName: "Kotak Mahindra Bank", category: "DEFAULT", foir: 60, ccObligationPercent: 2 }
+                { bankName: "HDFC Bank", category: "CAT A", foir: 70, ccObligationPercent: 5 },
+                { bankName: "ICICI Bank", category: "CAT B", foir: 65, ccObligationPercent: 5 },
+                { bankName: "Axis Bank", category: "CAT C", foir: 60, ccObligationPercent: 5 },
+                { bankName: "Kotak Mahindra Bank", category: "DEFAULT", foir: 60, ccObligationPercent: 5 }
             ];
         }
 

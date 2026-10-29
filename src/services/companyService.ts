@@ -18,12 +18,45 @@ export async function searchCompanies(search: string, dbOrPool?: any) {
     const k = getKnex(dbOrPool);
     if (!k) return [];
 
-    const rows = await k("managed_companies")
+    const clean = String(search || "").trim();
+    if (!clean) return [];
+
+    const lower = clean.toLowerCase();
+    const prefix = `${lower}%`;
+    const wordBoundary1 = `% ${lower}%`;
+    const wordBoundary2 = `%(${lower}%`;
+    const wordBoundary3 = `%/${lower}%`;
+    const wordBoundary4 = `%-${lower}%`;
+
+    let qb = k("managed_companies")
         .select("id", "company_name as name")
-        .where("active", 1)
-        .whereILike("company_name", `%${search}%`)
-        .orderBy("company_name", "asc")
-        .limit(30);
+        .where("active", 1);
+
+    // For short queries (1 or 2 letters like "t" or "tc"), strictly match companies starting with or having a word starting with the letters
+    if (clean.length < 3) {
+        qb = qb.andWhere(function () {
+            this.whereILike("company_name", prefix)
+                .orWhereILike("company_name", wordBoundary1)
+                .orWhereILike("company_name", wordBoundary2)
+                .orWhereILike("company_name", wordBoundary3)
+                .orWhereILike("company_name", wordBoundary4);
+        });
+    } else {
+        qb = qb.whereILike("company_name", `%${clean}%`);
+    }
+
+    const rows = await qb
+        .orderByRaw(`
+            CASE
+                WHEN LOWER(company_name) = ? THEN 1
+                WHEN LOWER(company_name) LIKE ? THEN 2
+                WHEN LOWER(company_name) LIKE ? OR LOWER(company_name) LIKE ? OR LOWER(company_name) LIKE ? OR LOWER(company_name) LIKE ? THEN 3
+                ELSE 4
+            END ASC,
+            LENGTH(company_name) ASC,
+            company_name ASC
+        `, [lower, prefix, wordBoundary1, wordBoundary2, wordBoundary3, wordBoundary4])
+        .limit(50);
 
     return rows.map((row: any) => ({
         id: Number(row.id),
@@ -39,11 +72,42 @@ export async function listCompanies(search: string, dbOrPool?: any) {
         .select("id", "company_name as name")
         .where("active", 1);
 
-    if (search && search.trim() !== "") {
-        qb = qb.whereILike("company_name", `%${search.trim()}%`);
+    const clean = String(search || "").trim();
+    if (clean !== "") {
+        const lower = clean.toLowerCase();
+        const prefix = `${lower}%`;
+        const wordBoundary1 = `% ${lower}%`;
+        const wordBoundary2 = `%(${lower}%`;
+        const wordBoundary3 = `%/${lower}%`;
+        const wordBoundary4 = `%-${lower}%`;
+
+        if (clean.length < 3) {
+            qb = qb.andWhere(function () {
+                this.whereILike("company_name", prefix)
+                    .orWhereILike("company_name", wordBoundary1)
+                    .orWhereILike("company_name", wordBoundary2)
+                    .orWhereILike("company_name", wordBoundary3)
+                    .orWhereILike("company_name", wordBoundary4);
+            });
+        } else {
+            qb = qb.whereILike("company_name", `%${clean}%`);
+        }
+
+        qb = qb.orderByRaw(`
+            CASE
+                WHEN LOWER(company_name) = ? THEN 1
+                WHEN LOWER(company_name) LIKE ? THEN 2
+                WHEN LOWER(company_name) LIKE ? OR LOWER(company_name) LIKE ? OR LOWER(company_name) LIKE ? OR LOWER(company_name) LIKE ? THEN 3
+                ELSE 4
+            END ASC,
+            LENGTH(company_name) ASC,
+            company_name ASC
+        `, [lower, prefix, wordBoundary1, wordBoundary2, wordBoundary3, wordBoundary4]);
+    } else {
+        qb = qb.orderBy("company_name", "asc");
     }
 
-    const rows = await qb.orderBy("company_name", "asc");
+    const rows = await qb;
 
     return rows.map((row: any) => ({
         id: Number(row.id),

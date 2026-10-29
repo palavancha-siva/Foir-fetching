@@ -59,6 +59,46 @@ function createApiRouter(state: any) {
         adminApiAuth,
         pincodeController.upload
     );
+    router.post(
+        configOptions.apiPrefix + "/admin/pincodes/upload-master",
+        adminApiAuth,
+        pincodeController.uploadMaster
+    );
+    router.post(
+        configOptions.apiPrefix + "/admin/pincodes/upload-bank",
+        adminApiAuth,
+        pincodeController.uploadBankServiceability
+    );
+    router.get(
+        configOptions.apiPrefix + "/admin/pincodes",
+        adminApiAuth,
+        pincodeController.list
+    );
+    router.patch(
+        configOptions.apiPrefix + "/admin/pincodes/:id/toggle",
+        adminApiAuth,
+        pincodeController.toggleServiceable
+    );
+    router.post(
+        configOptions.apiPrefix + "/admin/pincodes/states",
+        adminApiAuth,
+        pincodeController.addState
+    );
+    router.put(
+        configOptions.apiPrefix + "/admin/pincodes/states/:stateName",
+        adminApiAuth,
+        pincodeController.editState
+    );
+    router.delete(
+        configOptions.apiPrefix + "/admin/pincodes/states/:stateName",
+        adminApiAuth,
+        pincodeController.deleteState
+    );
+    router.put(
+        configOptions.apiPrefix + "/admin/pincodes/:id",
+        adminApiAuth,
+        pincodeController.editPincode
+    );
     router.get(
         configOptions.apiPrefix + "/companies",
         companyController.search

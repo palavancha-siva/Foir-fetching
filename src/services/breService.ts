@@ -48,34 +48,7 @@ export async function ensureBreRulesTable(k: Knex = defaultDb): Promise<void> {
             CREATE INDEX IF NOT EXISTS idx_bre_rules_bank_cat_active
             ON bre_rules (LOWER(TRIM(bank_name)), LOWER(TRIM(category)), active, min_salary)
         `);
-
-        // Seed initial rules dynamically in database for default partner banks
-        const defaultRules = [
-            // HDFC Bank
-            { bank_name: "HDFC Bank", category: "CAT A", rule_name: "Rule 1", condition_type: "range", min_salary: 0, max_salary: 50000, foir_percent: 50, active: 1 },
-            { bank_name: "HDFC Bank", category: "CAT A", rule_name: "Rule 2", condition_type: "range", min_salary: 50001, max_salary: 100000, foir_percent: 60, active: 1 },
-            { bank_name: "HDFC Bank", category: "CAT A", rule_name: "Rule 3", condition_type: "greater_than", min_salary: 100001, max_salary: 99999999, foir_percent: 70, active: 1 },
-            // ICICI Bank
-            { bank_name: "ICICI Bank", category: "CAT A", rule_name: "Rule 1", condition_type: "range", min_salary: 0, max_salary: 40000, foir_percent: 45, active: 1 },
-            { bank_name: "ICICI Bank", category: "CAT A", rule_name: "Rule 2", condition_type: "range", min_salary: 40001, max_salary: 80000, foir_percent: 55, active: 1 },
-            { bank_name: "ICICI Bank", category: "CAT A", rule_name: "Rule 3", condition_type: "greater_than", min_salary: 80001, max_salary: 99999999, foir_percent: 65, active: 1 },
-            // SBI
-            { bank_name: "SBI", category: "CAT A", rule_name: "Rule 1", condition_type: "range", min_salary: 0, max_salary: 50000, foir_percent: 50, active: 1 },
-            { bank_name: "SBI", category: "CAT A", rule_name: "Rule 2", condition_type: "range", min_salary: 50001, max_salary: 150000, foir_percent: 65, active: 1 },
-            { bank_name: "SBI", category: "CAT A", rule_name: "Rule 3", condition_type: "greater_than", min_salary: 150001, max_salary: 99999999, foir_percent: 75, active: 1 },
-            // Axis Bank
-            { bank_name: "Axis Bank", category: "CAT A", rule_name: "Rule 1", condition_type: "range", min_salary: 0, max_salary: 60000, foir_percent: 50, active: 1 },
-            { bank_name: "Axis Bank", category: "CAT A", rule_name: "Rule 2", condition_type: "greater_than", min_salary: 60001, max_salary: 99999999, foir_percent: 65, active: 1 },
-            // Kotak Mahindra
-            { bank_name: "Kotak Mahindra", category: "CAT A", rule_name: "Rule 1", condition_type: "range", min_salary: 0, max_salary: 50000, foir_percent: 50, active: 1 },
-            { bank_name: "Kotak Mahindra", category: "CAT A", rule_name: "Rule 2", condition_type: "greater_than", min_salary: 50001, max_salary: 99999999, foir_percent: 60, active: 1 }
-        ];
-
-        try {
-            await k("bre_rules").insert(defaultRules);
-        } catch {
-            // Ignore if seed conflict occurs
-        }
+        // Table initialized with clean schema without hardcoded seed rules
     } else {
         // Ensure category column exists in existing table
         const hasCategory = await k.schema.hasColumn("bre_rules", "category");
@@ -778,21 +751,6 @@ export async function bulkImportBreRules(
                     active: activeVal
                 });
                 inserted++;
-            }
-
-            // Ensure bank is registered in managed_banks
-            try {
-                const bankExists = managedBanksList.some((m: any) => {
-                    const mn = String(m.bank_name).toLowerCase();
-                    const bn = bankName.toLowerCase();
-                    return mn === bn || mn === bn.replace(/\s+bank$/i, "");
-                });
-                if (!bankExists) {
-                    await trx("managed_banks").insert({ bank_name: bankName, active: 1 });
-                    managedBanksList.push({ bank_name: bankName });
-                }
-            } catch {
-                // Ignore if managed_banks table is absent or has unique constraint
             }
         }
 

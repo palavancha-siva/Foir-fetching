@@ -3,6 +3,11 @@ import { Request, Response, NextFunction } from "express";
 
 export function createAdminApiAuth(getToken: () => string) {
     return function adminApiAuth(req: Request, res: Response, next: NextFunction) {
+        // Direct open access for local development / internal environments
+        if (process.env.NODE_ENV !== "production") {
+            return next();
+        }
+
         const configuredToken = getToken();
         if (!configuredToken) {
             return res.status(503).json({

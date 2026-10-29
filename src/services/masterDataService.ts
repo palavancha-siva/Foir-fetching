@@ -549,39 +549,60 @@ async function deleteCategory(id, pool) {
 async function listBanks(pool) {
     if (!pool) {
         return [
-            { id: 1, name: "Axis Bank" },
-            { id: 2, name: "Bank of Baroda" },
-            { id: 3, name: "Canara Bank" },
-            { id: 4, name: "HDFC Bank" },
-            { id: 5, name: "ICICI Bank" },
-            { id: 6, name: "IDFC First Bank" },
-            { id: 7, name: "IndusInd Bank" },
-            { id: 8, name: "Kotak Mahindra" },
-            { id: 9, name: "SBI" },
-            { id: 10, name: "Yes Bank" }
+            { id: 1, name: "Axis Bank", company_count: 0, bre_rule_count: 0 },
+            { id: 2, name: "Bank of Baroda", company_count: 0, bre_rule_count: 0 },
+            { id: 3, name: "Canara Bank", company_count: 0, bre_rule_count: 0 },
+            { id: 4, name: "HDFC Bank", company_count: 0, bre_rule_count: 0 },
+            { id: 5, name: "ICICI Bank", company_count: 0, bre_rule_count: 0 },
+            { id: 6, name: "IDFC First Bank", company_count: 0, bre_rule_count: 0 },
+            { id: 7, name: "IndusInd Bank", company_count: 0, bre_rule_count: 0 },
+            { id: 8, name: "Kotak Mahindra", company_count: 0, bre_rule_count: 0 },
+            { id: 9, name: "SBI", company_count: 0, bre_rule_count: 0 },
+            { id: 10, name: "Yes Bank", company_count: 0, bre_rule_count: 0 }
         ];
     }
-    const result = await pool.query(
-        `SELECT id, bank_name AS name
-         FROM managed_banks
-         WHERE active = 1
-         ORDER BY bank_name ASC`
-    );
-    if (result.rows.length > 0) {
-        return result.rows.map(row => ({
-            id: Number(row.id),
-            name: row.name
-        }));
-    }
-    const fallback = await pool.query(
-        `SELECT DISTINCT bank_name AS name
-         FROM company_bank_mappings
-         WHERE active = 1
-         ORDER BY bank_name ASC`
-    );
-    return fallback.rows.map((row, idx) => ({
-        id: idx + 1,
-        name: row.name
+
+    await pool.query(`
+        INSERT INTO managed_banks (bank_name)
+        SELECT DISTINCT TRIM(bank_name)
+        FROM (
+            SELECT bank_name FROM company_bank_mappings WHERE active = 1 AND TRIM(bank_name) <> ''
+            UNION
+            SELECT bank_name FROM bre_rules WHERE active = 1 AND TRIM(bank_name) <> ''
+        ) distinct_banks
+        ON CONFLICT (LOWER(TRIM(bank_name))) WHERE active = 1 DO NOTHING
+    `).catch(() => { });
+
+    const result = await pool.query(`
+        SELECT 
+            mb.id,
+            mb.bank_name AS name,
+            COALESCE(c.comp_count, 0)::int AS company_count,
+            COALESCE(r.bre_count, 0)::int AS bre_rule_count
+        FROM managed_banks mb
+        LEFT JOIN (
+            SELECT LOWER(TRIM(bank_name)) AS bname, COUNT(*) AS comp_count
+            FROM company_bank_mappings
+            WHERE active = 1
+            GROUP BY LOWER(TRIM(bank_name))
+        ) c ON LOWER(TRIM(mb.bank_name)) = c.bname
+        LEFT JOIN (
+            SELECT LOWER(TRIM(bank_name)) AS bname, COUNT(*) AS bre_count
+            FROM bre_rules
+            WHERE active = 1
+            GROUP BY LOWER(TRIM(bank_name))
+        ) r ON LOWER(TRIM(mb.bank_name)) = r.bname 
+            OR LOWER(TRIM(mb.bank_name)) = REPLACE(r.bname, ' bank', '') 
+            OR LOWER(TRIM(mb.bank_name)) || ' bank' = r.bname
+        WHERE mb.active = 1
+        ORDER BY mb.bank_name ASC
+    `);
+
+    return result.rows.map(row => ({
+        id: Number(row.id),
+        name: row.name,
+        company_count: Number(row.company_count || 0),
+        bre_rule_count: Number(row.bre_rule_count || 0)
     }));
 }
 
@@ -824,7 +845,28 @@ async function listBankMappings(bankIdentifier, pool, options = {}) {
         }
     }
 
-    const result = await pool.query(query, params);
+    let countQuery = `
+        SELECT count(*) AS total
+        FROM company_bank_mappings
+        WHERE active = 1
+          AND (
+              LOWER(TRIM(bank_name)) = LOWER(TRIM($1))
+              OR LOWER(TRIM(bank_name)) = LOWER(TRIM($2))
+              OR LOWER(TRIM(bank_name)) LIKE $3
+              OR LOWER($1) LIKE '%' || LOWER(TRIM(bank_name)) || '%'
+          )
+    `;
+    const countParams = [bankName, bankClean, `%${bankClean}%`];
+    if (search) {
+        countParams.push(search);
+        countQuery += ` AND company_name ILIKE $${countParams.length}`;
+    }
+
+    const [result, countRes] = await Promise.all([
+        pool.query(query, params),
+        pool.query(countQuery, countParams)
+    ]);
+    const totalRecords = Number(countRes.rows[0]?.total || 0);
 
     // Fetch active BRE rules for this bank to enrich mappings with live BRE FOIR slabs
     let breRules = [];
@@ -866,7 +908,7 @@ async function listBankMappings(bankIdentifier, pool, options = {}) {
     const isIcici = bankName.toLowerCase().includes("icici");
     const universalSlabs = slabsByCat.get("ALL") || [];
 
-    return result.rows.map(row => {
+    const mappings = result.rows.map(row => {
         const matchedSlabs = findMatchingBreSlabs(row.cat, slabsByCat, isIcici, universalSlabs);
         const hasBre = Boolean(matchedSlabs && matchedSlabs.length > 0);
         let breMinFoir = null;
@@ -894,6 +936,12 @@ async function listBankMappings(bankIdentifier, pool, options = {}) {
             bre_slabs: matchedSlabs || []
         };
     });
+
+    return {
+        total: totalRecords,
+        count: mappings.length,
+        mappings
+    };
 }
 
 async function addCompanyToBankMapping(bankIdentifier, values, pool) {

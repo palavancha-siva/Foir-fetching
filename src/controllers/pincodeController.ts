@@ -75,6 +75,7 @@ function createPincodeController(state) {
                 const serviceableFilter = req.query.serviceable !== undefined && req.query.serviceable !== ""
                     ? parseInt(req.query.serviceable, 10)
                     : null;
+                const bankFilter = String(req.query.bank || "").trim();
 
                 let query = db("pincode_master").where({ active: 1 });
 
@@ -96,6 +97,20 @@ function createPincodeController(state) {
 
                 if (serviceableFilter !== null && !isNaN(serviceableFilter)) {
                     query = query.where("serviceable_finnable", serviceableFilter);
+                }
+
+                if (bankFilter && bankFilter !== "all") {
+                    const cleanBank = bankFilter.toUpperCase();
+                    if (cleanBank.includes("FINNABLE")) {
+                        query = query.where("serviceable_finnable", 1);
+                    } else {
+                        query = query.whereIn("pincode", function () {
+                            this.select("pincode")
+                                .from("bank_pincode_serviceability")
+                                .whereRaw("UPPER(bank_name) = ?", [cleanBank])
+                                .andWhere("is_serviceable", 1);
+                        });
+                    }
                 }
 
                 const countRes = await query.clone().count("id as total").first();

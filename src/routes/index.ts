@@ -262,6 +262,16 @@ function createApiRouter(state: any) {
         adminApiAuth,
         breController.listRules
     );
+    router.get(
+        configOptions.apiPrefix + "/admin/bre/versions",
+        adminApiAuth,
+        breController.listVersions
+    );
+    router.post(
+        configOptions.apiPrefix + "/admin/bre/versions/:id/activate",
+        adminApiAuth,
+        breController.activateVersion
+    );
     router.post(
         configOptions.apiPrefix + "/admin/bre/rules",
         adminApiAuth,

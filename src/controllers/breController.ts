@@ -33,9 +33,26 @@ function createBreController(state) {
     return {
         listRules(req, res) {
             const bank = String(req.query.bank || "").trim();
+            const versionId = req.query.versionId || req.query.version_id;
             return execute(req, res, async pool => {
-                const rules = await breService.listRulesByBank(bank, pool);
+                const rules = await breService.listRulesByBank(bank, pool, versionId);
                 return res.json(rules);
+            });
+        },
+
+        listVersions(req, res) {
+            const bank = String(req.query.bank || req.query.bank_name || "").trim();
+            return execute(req, res, async pool => {
+                const versions = await breService.listVersionsByBank(bank, pool);
+                return res.json(versions);
+            });
+        },
+
+        activateVersion(req, res) {
+            const id = req.params.id;
+            return execute(req, res, async pool => {
+                const result = await breService.activateVersion(id, pool);
+                return res.json(result);
             });
         },
 
@@ -89,11 +106,22 @@ function createBreController(state) {
         uploadRules(req, res) {
             const csvContent = req.body && (req.body.csvContent || req.body.csv || req.body.fileContent);
             const defaultBank = req.body && req.body.defaultBank ? String(req.body.defaultBank).trim() : "";
+            const overrideBank = req.body && (req.body.overrideBank === true || req.body.overrideBank === "true" || (defaultBank && req.body.overrideBank !== false));
+            const filename = req.body && req.body.filename ? String(req.body.filename).trim() : "uploaded_rules.csv";
+            const uploadedBy = req.body && req.body.uploadedBy ? String(req.body.uploadedBy).trim() : "Admin";
+
             return execute(req, res, async pool => {
-                const summary = await breService.bulkImportBreRules(csvContent, defaultBank, pool);
+                const summary = await breService.bulkImportBreRules(
+                    csvContent,
+                    defaultBank,
+                    pool,
+                    Boolean(overrideBank),
+                    filename,
+                    uploadedBy
+                );
                 return res.json({
                     success: true,
-                    message: `Successfully processed ${summary.total} rules (${summary.inserted} added, ${summary.updated} updated) across ${summary.banks.length} banks.`,
+                    message: `Successfully uploaded ${summary.version ? summary.version.version_tag : "new version"} with ${summary.total} rules across ${summary.banks.length} bank(s). This version is now Active.`,
                     summary
                 });
             });

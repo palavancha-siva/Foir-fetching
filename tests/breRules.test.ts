@@ -7,6 +7,8 @@ import configOptions from "../config/configOptions";
 import {
     ensureBreRulesTable,
     listRulesByBank,
+    listVersionsByBank,
+    activateVersion,
     createRule,
     updateRule,
     toggleRuleStatus,
@@ -244,7 +246,41 @@ rule no.,condition,foir
         assert.ok(resolvedNoHlRes && resolvedNoHlRes.success, "breCtrl.resolveRule without HL should succeed");
         assert.equal(resolvedNoHlRes.foir, 65, "breCtrl.resolveRule should return 65% from DB for 75k without home loan");
 
+        // 15. Test BRE Versioning: Versions list, upload new version, rollback/activate version
+        const versions = await listVersionsByBank(testBankName, testDb);
+        assert.ok(Array.isArray(versions) && versions.length >= 1, "Should list versions for testBankName");
+        const v1 = versions.find((v: any) => v.version_number === 1) || versions[0];
+        assert.equal(v1.active, true, "First uploaded version should be Active");
+        assert.equal(v1.version_number, 1, "First version should have version_number 1");
+
+        // Upload Version 2 for testBankName with different FOIR values
+        const v2Csv = `Bank,Category,Rule Name,Condition Type,Min Salary,Max Salary,FOIR %,Active
+${testBankName},CAT A,V2 Rule 1,range,0,45000,52,1
+${testBankName},CAT A,V2 Rule 2,range,45001,90000,62,1
+${testBankName},CAT B,V2 Rule 3,greater_than,90001,99999999,72,1`;
+
+        const v2Bulk = await bulkImportBreRules(v2Csv, testBankName, testDb, true, "v2_rules.csv", "TestRunner");
+        assert.equal(v2Bulk.inserted, 3, "V2 should insert 3 rules");
+        assert.ok(v2Bulk.version, "V2 import should return new version object");
+        assert.equal(v2Bulk.version.version_number, 2, "V2 should be version_number 2");
+
+        // Now resolve FOIR - should resolve from V2 (52% for 30k)
+        const v2Resolved = await resolveBreFoir(testBankName, "CAT A", 30000, testDb);
+        assert.ok(v2Resolved, "V2 should resolve FOIR");
+        assert.equal(v2Resolved.foirPercent, 52, "V2 active rule should resolve to 52%");
+
+        // Rollback / Activate Version 1
+        const activated = await activateVersion(v1.id, testDb);
+        assert.ok(activated && activated.success, "activateVersion should succeed");
+        assert.equal(activated.version.version_number, 1, "Activated version should be V1");
+
+        // Now resolve FOIR again - should resolve from V1 (48% for 30k)
+        const v1Resolved = await resolveBreFoir(testBankName, "CAT A", 30000, testDb);
+        assert.ok(v1Resolved, "V1 should resolve FOIR after rollback");
+        assert.equal(v1Resolved.foirPercent, 48, "Rolled-back V1 rule should resolve to 48%");
+
         // Cleanup
+        await testDb("bre_rule_versions").whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [testBankName]).delete();
         await testDb("bre_rules").whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [testBankName]).delete();
         await testDb("managed_banks").whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [testBankName]).delete();
     } finally {

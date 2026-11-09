@@ -57,6 +57,37 @@ export async function ensureBreRulesTable(k: Knex = defaultDb): Promise<void> {
                 table.text("category").notNullable().defaultTo("CAT A");
             });
         }
+        // Ensure version_id column exists in existing table
+        const hasVersionId = await k.schema.hasColumn("bre_rules", "version_id");
+        if (!hasVersionId) {
+            await k.schema.alterTable("bre_rules", (table) => {
+                table.bigInteger("version_id").nullable();
+            });
+            await k.raw(`
+                CREATE INDEX IF NOT EXISTS idx_bre_rules_version_id
+                ON bre_rules (version_id)
+            `);
+        }
+    }
+
+    const versionsTableExists = await k.schema.hasTable("bre_rule_versions");
+    if (!versionsTableExists) {
+        await k.schema.createTable("bre_rule_versions", (table) => {
+            table.bigIncrements("id").primary();
+            table.text("bank_name").notNullable();
+            table.integer("version_number").notNullable().defaultTo(1);
+            table.text("version_tag").notNullable().defaultTo("v1");
+            table.text("filename").notNullable().defaultTo("rules.csv");
+            table.integer("rule_count").notNullable().defaultTo(0);
+            table.smallint("active").notNullable().defaultTo(1);
+            table.timestamp("uploaded_at", { useTz: true }).notNullable().defaultTo(k.fn.now());
+            table.text("uploaded_by").notNullable().defaultTo("Admin");
+        });
+
+        await k.raw(`
+            CREATE INDEX IF NOT EXISTS idx_bre_rule_versions_bank_active
+            ON bre_rule_versions (LOWER(TRIM(bank_name)), active, version_number DESC)
+        `);
     }
 
     try {
@@ -86,6 +117,54 @@ export async function ensureBreRulesTable(k: Knex = defaultDb): Promise<void> {
         `);
     } catch {
         // Ignore
+    }
+
+    // Baseline migration for existing legacy rules without a version_id
+    try {
+        const unversionedBanks = await k("bre_rules")
+            .whereNull("version_id")
+            .distinct("bank_name");
+
+        for (const row of unversionedBanks) {
+            const bName = row.bank_name;
+            if (!bName) continue;
+
+            let baselineVer = await k("bre_rule_versions")
+                .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bName])
+                .orderBy("version_number", "asc")
+                .first();
+
+            const countResult = await k("bre_rules")
+                .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bName])
+                .whereNull("version_id")
+                .count("id as total")
+                .first();
+            const totalRules = Number(countResult?.total || 0);
+
+            if (!baselineVer) {
+                const [newVer] = await k("bre_rule_versions")
+                    .insert({
+                        bank_name: bName,
+                        version_number: 1,
+                        version_tag: "v1 (Baseline)",
+                        filename: "initial_baseline.csv",
+                        rule_count: totalRules,
+                        active: 1,
+                        uploaded_by: "System Initializer"
+                    })
+                    .returning("*");
+                baselineVer = newVer;
+            }
+
+            if (baselineVer && baselineVer.id) {
+                await k("bre_rules")
+                    .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bName])
+                    .whereNull("version_id")
+                    .update({ version_id: baselineVer.id });
+            }
+        }
+    } catch (migErr) {
+        console.error("Migration baseline error in ensureBreRulesTable:", migErr);
     }
 
     tableEnsured = true;
@@ -143,9 +222,9 @@ export async function findOverlappingRule(
 }
 
 /**
- * Lists all BRE rules for a bank (both active and inactive) ordered by category and min_salary.
+ * Lists all uploaded rule versions for a partner bank ordered by version number descending.
  */
-export async function listRulesByBank(bankName: string, dbOrPool?: any) {
+export async function listVersionsByBank(bankName: string, dbOrPool?: any) {
     const k = getKnex(dbOrPool);
     await ensureBreRulesTable(k);
 
@@ -154,7 +233,124 @@ export async function listRulesByBank(bankName: string, dbOrPool?: any) {
         return [];
     }
 
-    const rows = await k("bre_rules")
+    const bankClean = bank.toLowerCase().replace(/\s+bank$/i, "").trim();
+
+    const rows = await k("bre_rule_versions")
+        .select(
+            "id",
+            "bank_name",
+            "version_number",
+            "version_tag",
+            "filename",
+            "rule_count",
+            "active",
+            "uploaded_at",
+            "uploaded_by"
+        )
+        .where((builder: any) => {
+            builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bank])
+                .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`])
+                .orWhereRaw("LOWER(TRIM(bank_name)) LIKE ?", [`%${bankClean}%`])
+                .orWhereRaw("LOWER(?) LIKE CONCAT('%', LOWER(TRIM(bank_name)), '%')", [bank]);
+        })
+        .orderBy("version_number", "desc");
+
+    return rows.map((r: any) => ({
+        id: Number(r.id),
+        bank_name: r.bank_name,
+        version_number: Number(r.version_number),
+        version_tag: r.version_tag || `v${r.version_number}`,
+        filename: r.filename,
+        rule_count: Number(r.rule_count),
+        active: Number(r.active) === 1,
+        uploaded_at: r.uploaded_at,
+        uploaded_by: r.uploaded_by
+    }));
+}
+
+/**
+ * Activates a specific rule version for a partner bank and atomically deactivates all other versions.
+ * Also synchronizes the active status of rules in `bre_rules` for that bank.
+ */
+export async function activateVersion(versionId: any, dbOrPool?: any) {
+    const k = getKnex(dbOrPool);
+    await ensureBreRulesTable(k);
+
+    const vId = Number(versionId);
+    if (!Number.isSafeInteger(vId) || vId <= 0) {
+        throw new BreRuleError("A valid version ID is required.");
+    }
+
+    const targetVer = await k("bre_rule_versions").where("id", vId).first();
+    if (!targetVer) {
+        throw new BreRuleError(`Rule version #${vId} not found.`, 404);
+    }
+
+    const bankName = targetVer.bank_name;
+    const bankClean = bankName.toLowerCase().replace(/\s+bank$/i, "").trim();
+
+    return await k.transaction(async (trx) => {
+        // 1. Mark all versions for this bank as Inactive
+        await trx("bre_rule_versions")
+            .where((builder: any) => {
+                builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                    .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                    .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
+            })
+            .update({ active: 0 });
+
+        // 2. Mark the targeted version as Active
+        await trx("bre_rule_versions")
+            .where("id", vId)
+            .update({ active: 1 });
+
+        // 3. Mark all rules for this bank as Inactive
+        await trx("bre_rules")
+            .where((builder: any) => {
+                builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                    .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                    .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
+            })
+            .update({ active: 0 });
+
+        // 4. Mark all rules belonging to this version as Active
+        await trx("bre_rules")
+            .where("version_id", vId)
+            .update({ active: 1 });
+
+        return {
+            success: true,
+            message: `Version ${targetVer.version_tag || ('v' + targetVer.version_number)} is now Active for ${bankName}. All previous versions have been set to Inactive for audit/rollback.`,
+            version: {
+                id: vId,
+                bank_name: bankName,
+                version_number: Number(targetVer.version_number),
+                version_tag: targetVer.version_tag || `v${targetVer.version_number}`,
+                filename: targetVer.filename,
+                rule_count: Number(targetVer.rule_count),
+                active: true
+            }
+        };
+    });
+}
+
+/**
+ * Lists BRE rules for a bank. If versionId is provided, returns rules for that version.
+ * Otherwise returns rules for the currently active version (or all baseline rules if unversioned).
+ */
+export async function listRulesByBank(bankName: string, dbOrPool?: any, versionId?: any) {
+    const k = getKnex(dbOrPool);
+    await ensureBreRulesTable(k);
+
+    const bank = String(bankName || "").trim();
+    if (!bank) {
+        return [];
+    }
+
+    const bankClean = bank.toLowerCase().replace(/\s+bank$/i, "").trim();
+
+    const qb = k("bre_rules")
         .select(
             "id",
             "bank_name",
@@ -165,17 +361,39 @@ export async function listRulesByBank(bankName: string, dbOrPool?: any) {
             "max_salary",
             "foir_percent",
             "active",
+            "version_id",
             "created_at",
             "updated_at"
         )
         .where((builder: any) => {
-            const bankClean = bank.toLowerCase().replace(/\s+bank$/i, "").trim();
             builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bank])
                 .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
                 .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`])
                 .orWhereRaw("LOWER(TRIM(bank_name)) LIKE ?", [`%${bankClean}%`])
                 .orWhereRaw("LOWER(?) LIKE CONCAT('%', LOWER(TRIM(bank_name)), '%')", [bank]);
-        })
+        });
+
+    const parsedVerId = Number(versionId);
+    if (Number.isSafeInteger(parsedVerId) && parsedVerId > 0) {
+        qb.where("version_id", parsedVerId);
+    } else {
+        // By default, filter by the active version if an active version exists
+        const activeVer = await k("bre_rule_versions")
+            .select("id")
+            .where("active", 1)
+            .where((builder: any) => {
+                builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bank])
+                    .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                    .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
+            })
+            .first();
+
+        if (activeVer) {
+            qb.where("version_id", activeVer.id);
+        }
+    }
+
+    const rows = await qb
         .orderBy("category", "asc")
         .orderBy("min_salary", "asc")
         .orderBy("id", "asc");
@@ -190,6 +408,7 @@ export async function listRulesByBank(bankName: string, dbOrPool?: any) {
         max_salary: Number(r.max_salary),
         foir_percent: Number(r.foir_percent),
         active: Number(r.active) === 1,
+        version_id: r.version_id ? Number(r.version_id) : null,
         created_at: r.created_at,
         updated_at: r.updated_at
     }));
@@ -286,6 +505,27 @@ export async function createRule(data: any, dbOrPool?: any) {
         );
     }
 
+    // Attach to active version for this bank if present, or create baseline v1
+    let activeVer = await k("bre_rule_versions")
+        .where("active", 1)
+        .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+        .first();
+
+    if (!activeVer) {
+        const [createdVer] = await k("bre_rule_versions")
+            .insert({
+                bank_name: bankName,
+                version_number: 1,
+                version_tag: "v1",
+                filename: `${bankName.toLowerCase().replace(/\s+/g, "_")}_rules_v1.csv`,
+                rule_count: 0,
+                active: 1,
+                uploaded_by: "Admin"
+            })
+            .returning("*");
+        activeVer = createdVer;
+    }
+
     const [created] = await k("bre_rules")
         .insert({
             bank_name: bankName,
@@ -295,7 +535,8 @@ export async function createRule(data: any, dbOrPool?: any) {
             min_salary: minSal,
             max_salary: maxSal,
             foir_percent: foirPercent,
-            active: 1
+            active: 1,
+            version_id: activeVer ? activeVer.id : null
         })
         .returning([
             "id",
@@ -307,9 +548,18 @@ export async function createRule(data: any, dbOrPool?: any) {
             "max_salary",
             "foir_percent",
             "active",
+            "version_id",
             "created_at",
             "updated_at"
         ]);
+
+    if (activeVer && activeVer.id) {
+        try {
+            await k("bre_rule_versions").where("id", activeVer.id).increment("rule_count", 1);
+        } catch {
+            // Ignore
+        }
+    }
 
     return {
         id: Number(created.id),
@@ -492,9 +742,22 @@ export async function deleteRule(id: any, dbOrPool?: any) {
         throw new BreRuleError("A valid rule ID is required.");
     }
 
-    const affected = await k("bre_rules").where("id", ruleId).delete();
-    if (!affected) {
+    const existingRule = await k("bre_rules").where("id", ruleId).first();
+    if (!existingRule) {
         throw new BreRuleError("BRE rule not found.", 404);
+    }
+
+    await k("bre_rules").where("id", ruleId).delete();
+
+    if (existingRule.version_id) {
+        try {
+            await k("bre_rule_versions")
+                .where("id", existingRule.version_id)
+                .where("rule_count", ">", 0)
+                .decrement("rule_count", 1);
+        } catch {
+            // Ignore
+        }
     }
 
     return { success: true, message: "Rule deleted successfully." };
@@ -622,13 +885,18 @@ function parseFoirFromRow(row: Record<string, string>): number | null {
 }
 
 /**
- * Bulk imports BRE rules from CSV content.
- * Automatically persists to PostgreSQL bre_rules and registers banks in managed_banks.
+ * Bulk imports BRE rules from CSV content into a new version.
+ * Does NOT overwrite or delete existing rules or versions.
+ * Previous versions are preserved as Inactive for audit and rollback.
+ * The newly uploaded version becomes the single Active version for the bank.
  */
 export async function bulkImportBreRules(
     csvContent: string,
     defaultBank: string = "",
-    dbOrPool?: any
+    dbOrPool?: any,
+    overrideBank: boolean = false,
+    filename: string = "uploaded_rules.csv",
+    uploadedBy: string = "Admin"
 ) {
     const k = getKnex(dbOrPool);
     await ensureBreRulesTable(k);
@@ -644,7 +912,6 @@ export async function bulkImportBreRules(
 
     return await k.transaction(async (trx) => {
         let inserted = 0;
-        let updated = 0;
         const banksSet = new Set<string>();
 
         let managedBanksList: Array<{ bank_name: string }> = [];
@@ -654,9 +921,23 @@ export async function bulkImportBreRules(
             // Ignore if managed_banks unavailable
         }
 
+        // 1. Parse and validate all rows
+        const parsedItems: Array<{
+            bankName: string;
+            category: string;
+            ruleName: string;
+            conditionType: string;
+            minSal: number;
+            maxSal: number;
+            foir: number;
+            activeVal: number;
+        }> = [];
+
         for (let i = 0; i < rows.length; i++) {
             const row = rows[i];
-            const rawBank = String(row.bank || row.bankname || row.lender || row.partnerbank || row._titlebank || defaultBank || "").trim();
+            const rawBank = (overrideBank && defaultBank)
+                ? defaultBank
+                : String(row.bank || row.bankname || row.lender || row.partnerbank || row._titlebank || defaultBank || "").trim();
             if (!rawBank) continue;
 
             // Resolve bank name against managed_banks (e.g. ICICI Bank <=> ICICI)
@@ -711,57 +992,131 @@ export async function bulkImportBreRules(
 
             if (salaryParsed.maxSal <= salaryParsed.minSal) continue;
 
-            // Check if rule exists by bank_name, category and rule_name
-            const existing = await trx("bre_rules")
-                .select("id")
+            parsedItems.push({
+                bankName,
+                category,
+                ruleName,
+                conditionType: salaryParsed.conditionType,
+                minSal: salaryParsed.minSal,
+                maxSal: salaryParsed.maxSal,
+                foir,
+                activeVal
+            });
+        }
+
+        if (parsedItems.length === 0) {
+            throw new BreRuleError("No valid rules could be parsed from the CSV. Please ensure the CSV contains salary columns (e.g. 'Min Salary, Max Salary' or 'Salary Range') and a 'FOIR' column.");
+        }
+
+        // 2. Group parsed rules by bank
+        const bankGroups = new Map<string, typeof parsedItems>();
+        for (const item of parsedItems) {
+            const key = item.bankName.toLowerCase();
+            if (!bankGroups.has(key)) {
+                bankGroups.set(key, []);
+            }
+            bankGroups.get(key)!.push(item);
+        }
+
+        const createdVersions: any[] = [];
+
+        for (const [_bKey, bItems] of bankGroups) {
+            const bankName = bItems[0].bankName;
+            const bankClean = bankName.toLowerCase().replace(/\s+bank$/i, "").trim();
+
+            // Find current max version number for this bank
+            const maxVerRow = await trx("bre_rule_versions")
                 .where((builder: any) => {
-                    const bClean = bankName.toLowerCase().replace(/\s+bank$/i, "");
                     builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
-                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bClean])
-                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bClean} bank`]);
+                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
                 })
-                .whereRaw("LOWER(TRIM(category)) = LOWER(TRIM(?))", [category])
-                .whereRaw("LOWER(TRIM(rule_name)) = LOWER(TRIM(?))", [ruleName])
+                .max("version_number as max_ver")
                 .first();
 
-            if (existing) {
-                await trx("bre_rules")
-                    .where("id", existing.id)
-                    .update({
-                        bank_name: bankName,
-                        category: category,
-                        rule_name: ruleName,
-                        condition_type: salaryParsed.conditionType,
-                        min_salary: salaryParsed.minSal,
-                        max_salary: salaryParsed.maxSal,
-                        foir_percent: foir,
-                        active: activeVal,
-                        updated_at: trx.fn.now()
-                    });
-                updated++;
-            } else {
+            const nextVersionNum = (Number(maxVerRow?.max_ver) || 0) + 1;
+            const versionTag = `v${nextVersionNum}`;
+            const safeFilename = filename && filename.trim()
+                ? filename.trim()
+                : `${bankName.toLowerCase().replace(/\s+/g, "_")}_rules_${versionTag}.csv`;
+
+            // Mark all prior versions for this bank as Inactive (retained for audit/rollback)
+            await trx("bre_rule_versions")
+                .where((builder: any) => {
+                    builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
+                })
+                .update({ active: 0 });
+
+            // Mark all existing rules for this bank as Inactive
+            await trx("bre_rules")
+                .where((builder: any) => {
+                    builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                        .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
+                })
+                .update({ active: 0 });
+
+            // Insert new version record as the sole Active version
+            const [newVer] = await trx("bre_rule_versions")
+                .insert({
+                    bank_name: bankName,
+                    version_number: nextVersionNum,
+                    version_tag: versionTag,
+                    filename: safeFilename,
+                    rule_count: bItems.length,
+                    active: 1,
+                    uploaded_by: uploadedBy || "Admin",
+                    uploaded_at: trx.fn.now()
+                })
+                .returning([
+                    "id",
+                    "bank_name",
+                    "version_number",
+                    "version_tag",
+                    "filename",
+                    "rule_count",
+                    "active",
+                    "uploaded_at",
+                    "uploaded_by"
+                ]);
+
+            createdVersions.push({
+                id: Number(newVer.id),
+                bank_name: newVer.bank_name,
+                version_number: Number(newVer.version_number),
+                version_tag: newVer.version_tag,
+                filename: newVer.filename,
+                rule_count: Number(newVer.rule_count),
+                active: Number(newVer.active) === 1,
+                uploaded_at: newVer.uploaded_at,
+                uploaded_by: newVer.uploaded_by
+            });
+
+            // Insert each rule into bre_rules linked to this new version_id and active = 1
+            for (const item of bItems) {
                 await trx("bre_rules").insert({
                     bank_name: bankName,
-                    category: category,
-                    rule_name: ruleName,
-                    condition_type: salaryParsed.conditionType,
-                    min_salary: salaryParsed.minSal,
-                    max_salary: salaryParsed.maxSal,
-                    foir_percent: foir,
-                    active: activeVal
+                    category: item.category,
+                    rule_name: item.ruleName,
+                    condition_type: item.conditionType,
+                    min_salary: item.minSal,
+                    max_salary: item.maxSal,
+                    foir_percent: item.foir,
+                    active: item.activeVal,
+                    version_id: newVer.id
                 });
                 inserted++;
             }
         }
 
-        if (inserted === 0 && updated === 0) {
-            throw new BreRuleError("No valid rules could be parsed from the CSV. Please ensure the CSV contains salary columns (e.g. 'Min Salary, Max Salary' or 'Salary Range') and a 'FOIR' column.");
-        }
-
         return {
-            total: rows.length,
+            total: parsedItems.length,
             inserted,
-            updated,
+            updated: 0,
+            versions: createdVersions,
+            version: createdVersions[0] || null,
             banks: Array.from(banksSet)
         };
     });
@@ -769,6 +1124,7 @@ export async function bulkImportBreRules(
 
 /**
  * Resolves the applicable FOIR for an applicant dynamically from active BRE rules.
+ * Strictly scopes rule evaluation to the single ACTIVE version for the specified bank.
  * If bank is ICICI, resolves uniformly across categories.
  * Accurately matches Home Loan condition rules when applicant has a Home Loan.
  */
@@ -805,7 +1161,18 @@ export async function resolveBreFoir(
 
     const bankClean = bank.toLowerCase().replace(/\s+bank$/i, "").trim();
 
-    const rulesForSal = await k("bre_rules")
+    // Query active version for this bank
+    const activeVer = await k("bre_rule_versions")
+        .select("id")
+        .where("active", 1)
+        .where((builder: any) => {
+            builder.whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bank])
+                .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+                .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
+        })
+        .first();
+
+    const rulesForSalQb = k("bre_rules")
         .select("rule_name", "category", "foir_percent", "min_salary", "max_salary")
         .where("active", 1)
         .where((builder: any) => {
@@ -814,8 +1181,13 @@ export async function resolveBreFoir(
                 .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [`${bankClean} bank`]);
         })
         .where("min_salary", "<=", sal)
-        .where("max_salary", ">=", sal)
-        .orderBy("min_salary", "desc");
+        .where("max_salary", ">=", sal);
+
+    if (activeVer) {
+        rulesForSalQb.where("version_id", activeVer.id);
+    }
+
+    const rulesForSal = await rulesForSalQb.orderBy("min_salary", "desc");
 
     if (!rulesForSal || rulesForSal.length === 0) {
         return null;
@@ -876,6 +1248,8 @@ export default {
     BreRuleError,
     ensureBreRulesTable,
     listRulesByBank,
+    listVersionsByBank,
+    activateVersion,
     createRule,
     updateRule,
     toggleRuleStatus,

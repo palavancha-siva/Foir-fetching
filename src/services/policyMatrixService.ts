@@ -89,9 +89,10 @@ export async function getDynamicFoirFromDb(category: string, salary: number, dbO
         console.error("Database policy matrix lookup error:", err.message);
     }
 
+    const isUnlistedOrDelist = /delist|unlisted|negative|non-cat/i.test(cat);
     return {
-        foir: 70,
-        salarySlab: "Standard",
+        foir: isUnlistedOrDelist ? (sal >= 50000 ? 50 : 45) : 60,
+        salarySlab: isUnlistedOrDelist ? "Category C & Unlisted / Delist" : "Standard",
         multiplier: 0,
         category: cat || "DEFAULT"
     };

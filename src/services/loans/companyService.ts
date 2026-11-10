@@ -1,6 +1,7 @@
 import db from "../../utils/dbUtil";
 import { Company } from "../../models/companies/company";
 import { CompanyBankMapping } from "../../models/companies/companyBankMapping";
+import { getCompanyMappings as resolveMappings } from "../companyService";
 
 export class CompanyService {
     async searchCompanies(query: string = ""): Promise<Array<{ id: number; name: string }>> {
@@ -105,12 +106,15 @@ export class CompanyService {
     }
 
     async getCompanyMappings(companyName: string): Promise<Array<any>> {
-        const clean = String(companyName || "").trim();
-        return db("company_bank_mappings")
-            .select("id", "company_name as companyName", "bank_name as bankName", "cat", "foir", "cc_obligation_percent as ccObligationPercent")
-            .where("active", 1)
-            .andWhereRaw("LOWER(TRIM(company_name)) = LOWER(TRIM(?))", [clean])
-            .orderBy("foir", "desc");
+        const { rows } = await resolveMappings(companyName, db);
+        return rows.map(r => ({
+            id: r.id,
+            companyName: r.company_name,
+            bankName: r.bank_name,
+            cat: r.cat,
+            foir: r.foir,
+            ccObligationPercent: r.cc_obligation_percent
+        }));
     }
 }
 

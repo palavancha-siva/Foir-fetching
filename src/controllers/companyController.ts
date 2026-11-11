@@ -7,6 +7,14 @@ const { resolveDynamicFoir } = require("../helpers/policyMatrix");
 const { resolveBreFoir } = require("../services/breService");
 const { lookupPincode, isBankServiceableForPincode } = require("../services/pincodeService");
 const { categoryMatches } = require("../utils/categoryMatcher");
+const { db: defaultDb } = require("../utils/dbUtil");
+
+function getKnex(dbOrPool) {
+    if (dbOrPool && typeof dbOrPool === "function" && typeof dbOrPool.select === "function") {
+        return dbOrPool;
+    }
+    return defaultDb;
+}
 
 function sortLendersByFoirDesc(a, b) {
     const foirA = Number(a && a.foir) || 0;
@@ -89,31 +97,31 @@ async function evaluateCatalogFreeLenders(companyName, salary, knownCategories =
     if (!pool || salary <= 0) return [];
 
     try {
+        const k = getKnex(pool);
         // Query lenders that have active BRE rules but NO company-specific catalog in company_bank_mappings (e.g. INCRID)
-        const q = `
-            SELECT DISTINCT b.bank_name
-            FROM bre_rules b
-            WHERE b.active = 1
-              AND LOWER(TRIM(b.bank_name)) != 'finnable'
-              AND NOT EXISTS (
-                  SELECT 1 FROM company_bank_mappings c
-                  WHERE LOWER(TRIM(c.bank_name)) = LOWER(TRIM(b.bank_name))
-                     OR LOWER(TRIM(c.bank_name)) = LOWER(TRIM(REPLACE(b.bank_name, ' BANK', '')))
-              )
-            ORDER BY b.bank_name ASC
-        `;
-        const res = await pool.query(q);
-        const catalogFreeBanks = res.rows.map(r => r.bank_name);
+        const rows = await k("bre_rules as b")
+            .distinct("b.bank_name")
+            .where("b.active", 1)
+            .whereRaw("LOWER(TRIM(b.bank_name)) != 'finnable'")
+            .whereNotExists(function() {
+                this.select(1)
+                    .from("company_bank_mappings as c")
+                    .whereRaw("LOWER(TRIM(c.bank_name)) = LOWER(TRIM(b.bank_name))")
+                    .orWhereRaw("LOWER(TRIM(c.bank_name)) = LOWER(TRIM(REPLACE(b.bank_name, ' BANK', '')))");
+            })
+            .orderBy("b.bank_name", "asc");
+
+        const catalogFreeBanks = rows.map(r => r.bank_name);
         if (catalogFreeBanks.length === 0) return [];
 
         const openLenders = [];
 
         for (const bankName of catalogFreeBanks) {
-            const catRes = await pool.query(
-                "SELECT DISTINCT category FROM bre_rules WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1)) AND active = 1",
-                [bankName]
-            );
-            const bankCats = catRes.rows.map(r => r.category);
+            const catRows = await k("bre_rules")
+                .distinct("category")
+                .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                .where("active", 1);
+            const bankCats = catRows.map(r => r.category);
 
             let targetCategory = null;
 
@@ -274,12 +282,13 @@ function createCompanyController(state) {
                         // If the lender has active configured BRE rules for this specific category, but applicant did not qualify (e.g. salary < min threshold for category)
                         if (pool && salary > 0) {
                             try {
-                                const bankRulesRes = await pool.query(
-                                    "SELECT id, rule_name, category, min_salary, max_salary FROM bre_rules WHERE active = 1 AND LOWER(TRIM(bank_name)) = LOWER(TRIM($1))",
-                                    [row.bank_name]
-                                );
-                                if (bankRulesRes.rows.length > 0) {
-                                    const matchingCatRules = bankRulesRes.rows.filter(r => categoryMatches(row.cat, r.category));
+                                const k = getKnex(pool);
+                                const bankRulesRes = await k("bre_rules")
+                                    .select("id", "rule_name", "category", "min_salary", "max_salary")
+                                    .where("active", 1)
+                                    .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [row.bank_name]);
+                                if (bankRulesRes.length > 0) {
+                                    const matchingCatRules = bankRulesRes.filter(r => categoryMatches(row.cat, r.category));
                                     if (matchingCatRules.length > 0) {
                                         // Bank explicitly defines rules for this category, but applicant's salary is outside all defined slabs
                                         return null;

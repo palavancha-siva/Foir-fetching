@@ -1,19 +1,38 @@
 // @ts-nocheck
 "use strict";
 
+const { Knex } = require("knex");
+const { db: defaultDb } = require("../utils/dbUtil");
 const { parseCsv, normalizeCsvRow } = require("../utils/csvParser");
 const { findMatchingBreCategory, categoryMatches } = require("../utils/categoryMatcher");
 
 class MasterDataNotFoundError extends Error { }
 class InvalidMasterDataInputError extends Error { }
 
-async function initializeMasterData(pool) {
-    await pool.query(`
+function getKnex(dbOrPool) {
+    if (dbOrPool && typeof dbOrPool === "function" && typeof dbOrPool.select === "function") {
+        return dbOrPool;
+    }
+    return defaultDb;
+}
+
+async function inTransaction(dbOrPool, operation) {
+    const k = getKnex(dbOrPool);
+    return k.transaction(async (trx) => {
+        return operation(trx);
+    });
+}
+
+async function initializeMasterData(dbOrPool) {
+    const k = getKnex(dbOrPool);
+
+    await k.raw(`
         ALTER TABLE company_bank_mappings
         ADD COLUMN IF NOT EXISTS cc_obligation_percent
         NUMERIC(5,2) NOT NULL DEFAULT 2
     `);
-    await pool.query(`
+
+    await k.raw(`
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -30,7 +49,8 @@ async function initializeMasterData(pool) {
         END;
         $$
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE TABLE IF NOT EXISTS managed_companies (
             id BIGSERIAL PRIMARY KEY,
             company_name TEXT NOT NULL,
@@ -39,13 +59,15 @@ async function initializeMasterData(pool) {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE UNIQUE INDEX IF NOT EXISTS
         uq_managed_companies_active_name
         ON managed_companies (LOWER(TRIM(company_name)))
         WHERE active = 1
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE TABLE IF NOT EXISTS bank_categories (
             id BIGSERIAL PRIMARY KEY,
             name TEXT NOT NULL,
@@ -54,13 +76,15 @@ async function initializeMasterData(pool) {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE UNIQUE INDEX IF NOT EXISTS
         uq_bank_categories_active_name
         ON bank_categories (LOWER(TRIM(name)))
         WHERE active = 1
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE TABLE IF NOT EXISTS managed_banks (
             id BIGSERIAL PRIMARY KEY,
             bank_name TEXT NOT NULL,
@@ -69,13 +93,15 @@ async function initializeMasterData(pool) {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE UNIQUE INDEX IF NOT EXISTS
         uq_managed_banks_active_name
         ON managed_banks (LOWER(TRIM(bank_name)))
         WHERE active = 1
     `);
-    await pool.query(`
+
+    await k.raw(`
         INSERT INTO managed_companies (company_name)
         SELECT DISTINCT TRIM(company_name)
         FROM company_bank_mappings
@@ -83,7 +109,8 @@ async function initializeMasterData(pool) {
         AND TRIM(company_name) <> ''
         ON CONFLICT DO NOTHING
     `);
-    await pool.query(`
+
+    await k.raw(`
         INSERT INTO managed_banks (bank_name)
         SELECT DISTINCT TRIM(bank_name)
         FROM company_bank_mappings
@@ -91,7 +118,8 @@ async function initializeMasterData(pool) {
         AND TRIM(bank_name) <> ''
         ON CONFLICT DO NOTHING
     `);
-    await pool.query(`
+
+    await k.raw(`
         INSERT INTO bank_categories (name)
         SELECT DISTINCT TRIM(cat)
         FROM company_bank_mappings
@@ -100,7 +128,8 @@ async function initializeMasterData(pool) {
         AND TRIM(cat) <> ''
         ON CONFLICT DO NOTHING
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE TABLE IF NOT EXISTS bank_employer_catalog (
             id BIGSERIAL PRIMARY KEY,
             bank_name TEXT NOT NULL,
@@ -113,12 +142,14 @@ async function initializeMasterData(pool) {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE UNIQUE INDEX IF NOT EXISTS uq_bank_employer_catalog_bank_emp
         ON bank_employer_catalog (LOWER(TRIM(bank_name)), LOWER(TRIM(employer_name)))
         WHERE active = 1
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE TABLE IF NOT EXISTS bank_policy_matrix (
             id BIGSERIAL PRIMARY KEY,
             bank_name TEXT NOT NULL,
@@ -137,7 +168,8 @@ async function initializeMasterData(pool) {
             CONSTRAINT chk_foir_matrix_range CHECK (foir_percent >= 0 AND foir_percent <= 100)
         )
     `);
-    await pool.query(`
+
+    await k.raw(`
         CREATE INDEX IF NOT EXISTS idx_bank_policy_matrix_lookup
         ON bank_policy_matrix (LOWER(TRIM(bank_name)), LOWER(TRIM(category)), min_salary, max_salary, tenure_months)
         WHERE active = 1
@@ -218,70 +250,68 @@ function normalizePercentage(value, label, defaultValue = 2) {
     return parsed;
 }
 
-async function ensureCategory(name, client) {
+async function ensureCategory(name, trx) {
     if (!name) return null;
-    await client.query(
-        `INSERT INTO bank_categories (name)
-         SELECT $1
-         WHERE NOT EXISTS (
-             SELECT 1 FROM bank_categories
-             WHERE active = 1 AND LOWER(TRIM(name)) = LOWER(TRIM($1))
-         )
-         ON CONFLICT DO NOTHING`,
-        [name]
-    );
-    return name;
-}
+    const trimmed = name.trim();
+    const existing = await trx("bank_categories")
+        .select("id")
+        .where("active", 1)
+        .whereRaw("LOWER(TRIM(name)) = LOWER(TRIM(?))", [trimmed])
+        .first();
 
-async function inTransaction(pool, operation) {
-    const client = await pool.connect();
-    try {
-        await client.query("BEGIN");
-        const result = await operation(client);
-        await client.query("COMMIT");
-        return result;
-    } catch (error) {
-        try {
-            await client.query("ROLLBACK");
-        } catch (rollbackError) {
-            console.error("Master-data transaction rollback failed:", rollbackError.message);
-        }
-        throw error;
-    } finally {
-        client.release();
+    if (!existing) {
+        await trx("bank_categories")
+            .insert({
+                name: trimmed,
+                active: 1
+            })
+            .onConflict(trx.raw("(LOWER(TRIM(name))) WHERE active = 1"))
+            .ignore();
     }
+    return trimmed;
 }
 
-async function getActiveCompany(companyId, client) {
-    const result = await client.query(
-        `SELECT company_name
-         FROM managed_companies
-         WHERE id = $1 AND active = 1
-         FOR UPDATE`,
-        [companyId]
-    );
-    if (result.rowCount === 0) {
+async function getActiveCompany(companyId, trx) {
+    const row = await trx("managed_companies")
+        .select("company_name")
+        .where("id", companyId)
+        .where("active", 1)
+        .forUpdate()
+        .first();
+
+    if (!row) {
         throw new MasterDataNotFoundError("Company was not found.");
     }
-    return result.rows[0].company_name;
+    return row.company_name;
 }
 
-async function listCompanyMappings(companyId, pool) {
+async function listCompanyMappings(companyId, dbOrPool) {
     const id = normalizeId(companyId);
-    const result = await pool.query(
-        `SELECT mapping.id, mapping.company_name, mapping.bank_name,
-                mapping.cat, mapping.foir, mapping.cc_obligation_percent
-         FROM company_bank_mappings AS mapping
-         JOIN managed_companies AS company
-           ON LOWER(TRIM(company.company_name)) =
-              LOWER(TRIM(mapping.company_name))
-         WHERE company.id = $1
-           AND company.active = 1
-           AND mapping.active = 1
-         ORDER BY mapping.bank_name ASC, mapping.cat ASC`,
-        [id]
-    );
-    return result.rows.map(row => ({
+    const k = getKnex(dbOrPool);
+
+    const rows = await k("company_bank_mappings as mapping")
+        .select(
+            "mapping.id",
+            "mapping.company_name",
+            "mapping.bank_name",
+            "mapping.cat",
+            "mapping.foir",
+            "mapping.cc_obligation_percent"
+        )
+        .join("managed_companies as company", function () {
+            this.on(
+                k.raw("LOWER(TRIM(company.company_name))"),
+                "=",
+                k.raw("LOWER(TRIM(mapping.company_name))")
+            );
+        })
+        .where("company.id", id)
+        .where("company.active", 1)
+        .where("mapping.active", 1)
+        .orderBy("mapping.bank_name", "asc")
+        .orderBy("mapping.cat", "asc");
+
+    return rows.map((row) => ({
         id: Number(row.id),
         company_name: row.company_name,
         bank_name: row.bank_name,
@@ -291,7 +321,7 @@ async function listCompanyMappings(companyId, pool) {
     }));
 }
 
-async function addBankMapping(companyId, values, pool) {
+async function addBankMapping(companyId, values, dbOrPool) {
     const id = normalizeId(companyId);
     const bankName = normalizeName(values.bank_name, "Bank name");
     const category = values.cat == null || values.cat === ""
@@ -303,19 +333,28 @@ async function addBankMapping(companyId, values, pool) {
         "CC obligation percentage"
     );
 
-    return inTransaction(pool, async client => {
-        const companyName = await getActiveCompany(id, client);
-        await ensureCategory(category, client);
-        const result = await client.query(
-            `INSERT INTO company_bank_mappings
-                (company_name, bank_name, cat, foir,
-                 cc_obligation_percent, active)
-             VALUES ($1, $2, $3, $4, $5, 1)
-             RETURNING id, company_name, bank_name, cat, foir,
-                       cc_obligation_percent`,
-            [companyName, bankName, category, foir, ccObligationPercent]
-        );
-        const row = result.rows[0];
+    return inTransaction(dbOrPool, async (trx) => {
+        const companyName = await getActiveCompany(id, trx);
+        await ensureCategory(category, trx);
+
+        const [row] = await trx("company_bank_mappings")
+            .insert({
+                company_name: companyName,
+                bank_name: bankName,
+                cat: category,
+                foir: foir,
+                cc_obligation_percent: ccObligationPercent,
+                active: 1
+            })
+            .returning([
+                "id",
+                "company_name",
+                "bank_name",
+                "cat",
+                "foir",
+                "cc_obligation_percent"
+            ]);
+
         return {
             id: Number(row.id),
             company_name: row.company_name,
@@ -327,7 +366,7 @@ async function addBankMapping(companyId, values, pool) {
     });
 }
 
-async function updateBankMapping(companyId, mappingId, values, pool) {
+async function updateBankMapping(companyId, mappingId, values, dbOrPool) {
     const id = normalizeId(companyId);
     const mapping = normalizeId(mappingId);
     const bankName = normalizeName(values.bank_name, "Bank name");
@@ -340,31 +379,34 @@ async function updateBankMapping(companyId, mappingId, values, pool) {
         "CC obligation percentage"
     );
 
-    return inTransaction(pool, async client => {
-        const companyName = await getActiveCompany(id, client);
-        await ensureCategory(category, client);
-        const result = await client.query(
-            `UPDATE company_bank_mappings
-             SET bank_name = $3, cat = $4, foir = $5,
-                 cc_obligation_percent = $6, updated_at = NOW()
-             WHERE id = $1
-               AND active = 1
-               AND LOWER(TRIM(company_name)) = LOWER(TRIM($2))
-             RETURNING id, company_name, bank_name, cat, foir,
-                       cc_obligation_percent`,
-            [
-                mapping,
-                companyName,
-                bankName,
-                category,
-                foir,
-                ccObligationPercent
-            ]
-        );
-        if (result.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const companyName = await getActiveCompany(id, trx);
+        await ensureCategory(category, trx);
+
+        const updated = await trx("company_bank_mappings")
+            .where("id", mapping)
+            .where("active", 1)
+            .whereRaw("LOWER(TRIM(company_name)) = LOWER(TRIM(?))", [companyName])
+            .update({
+                bank_name: bankName,
+                cat: category,
+                foir: foir,
+                cc_obligation_percent: ccObligationPercent,
+                updated_at: trx.fn.now()
+            })
+            .returning([
+                "id",
+                "company_name",
+                "bank_name",
+                "cat",
+                "foir",
+                "cc_obligation_percent"
+            ]);
+
+        if (!updated || updated.length === 0) {
             throw new MasterDataNotFoundError("Bank mapping was not found.");
         }
-        const row = result.rows[0];
+        const row = updated[0];
         return {
             id: Number(row.id),
             company_name: row.company_name,
@@ -376,178 +418,193 @@ async function updateBankMapping(companyId, mappingId, values, pool) {
     });
 }
 
-async function deleteBankMapping(companyId, mappingId, pool) {
+async function deleteBankMapping(companyId, mappingId, dbOrPool) {
     const id = normalizeId(companyId);
     const mapping = normalizeId(mappingId);
 
-    return inTransaction(pool, async client => {
-        const companyName = await getActiveCompany(id, client);
-        const result = await client.query(
-            `UPDATE company_bank_mappings
-             SET active = 0, updated_at = NOW()
-             WHERE id = $1
-               AND active = 1
-               AND LOWER(TRIM(company_name)) = LOWER(TRIM($2))
-             RETURNING id`,
-            [mapping, companyName]
-        );
-        if (result.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const companyName = await getActiveCompany(id, trx);
+        const count = await trx("company_bank_mappings")
+            .where("id", mapping)
+            .where("active", 1)
+            .whereRaw("LOWER(TRIM(company_name)) = LOWER(TRIM(?))", [companyName])
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
+
+        if (count === 0) {
             throw new MasterDataNotFoundError("Bank mapping was not found.");
         }
     });
 }
 
-async function addCompany(name, pool) {
-    const result = await pool.query(
-        `INSERT INTO managed_companies (company_name)
-         VALUES ($1)
-         RETURNING id, company_name AS name`,
-        [normalizeName(name, "Company name")]
-    );
-    return { id: Number(result.rows[0].id), name: result.rows[0].name };
+async function addCompany(name, dbOrPool) {
+    const compName = normalizeName(name, "Company name");
+    const k = getKnex(dbOrPool);
+
+    const [row] = await k("managed_companies")
+        .insert({
+            company_name: compName,
+            active: 1
+        })
+        .returning(["id", "company_name as name"]);
+
+    return { id: Number(row.id), name: row.name };
 }
 
-async function updateCompany(id, name, pool) {
+async function updateCompany(id, name, dbOrPool) {
     const companyId = normalizeId(id);
     const companyName = normalizeName(name, "Company name");
 
-    return inTransaction(pool, async client => {
-        const current = await client.query(
-            `SELECT company_name
-             FROM managed_companies
-             WHERE id = $1 AND active = 1
-             FOR UPDATE`,
-            [companyId]
-        );
-        if (current.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const current = await trx("managed_companies")
+            .select("company_name")
+            .where("id", companyId)
+            .where("active", 1)
+            .forUpdate()
+            .first();
+
+        if (!current) {
             throw new MasterDataNotFoundError("Company was not found.");
         }
 
-        const oldName = current.rows[0].company_name;
-        const updated = await client.query(
-            `UPDATE managed_companies
-             SET company_name = $2, updated_at = NOW()
-             WHERE id = $1
-             RETURNING id, company_name AS name`,
-            [companyId, companyName]
-        );
-        await client.query(
-            `UPDATE company_bank_mappings
-             SET company_name = $2, updated_at = NOW()
-             WHERE LOWER(TRIM(company_name)) = LOWER(TRIM($1))`,
-            [oldName, companyName]
-        );
-        return { id: Number(updated.rows[0].id), name: updated.rows[0].name };
+        const oldName = current.company_name;
+        const [updated] = await trx("managed_companies")
+            .where("id", companyId)
+            .update({
+                company_name: companyName,
+                updated_at: trx.fn.now()
+            })
+            .returning(["id", "company_name as name"]);
+
+        await trx("company_bank_mappings")
+            .whereRaw("LOWER(TRIM(company_name)) = LOWER(TRIM(?))", [oldName])
+            .update({
+                company_name: companyName,
+                updated_at: trx.fn.now()
+            });
+
+        return { id: Number(updated.id), name: updated.name };
     });
 }
 
-async function deleteCompany(id, pool) {
+async function deleteCompany(id, dbOrPool) {
     const companyId = normalizeId(id);
 
-    return inTransaction(pool, async client => {
-        const current = await client.query(
-            `SELECT company_name
-             FROM managed_companies
-             WHERE id = $1 AND active = 1
-             FOR UPDATE`,
-            [companyId]
-        );
-        if (current.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const current = await trx("managed_companies")
+            .select("company_name")
+            .where("id", companyId)
+            .where("active", 1)
+            .forUpdate()
+            .first();
+
+        if (!current) {
             throw new MasterDataNotFoundError("Company was not found.");
         }
 
-        await client.query(
-            `UPDATE company_bank_mappings
-             SET active = 0, updated_at = NOW()
-             WHERE LOWER(TRIM(company_name)) = LOWER(TRIM($1))
-             AND active = 1`,
-            [current.rows[0].company_name]
-        );
-        await client.query(
-            `UPDATE managed_companies
-             SET active = 0, updated_at = NOW()
-             WHERE id = $1`,
-            [companyId]
-        );
+        await trx("company_bank_mappings")
+            .whereRaw("LOWER(TRIM(company_name)) = LOWER(TRIM(?))", [current.company_name])
+            .where("active", 1)
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
+
+        await trx("managed_companies")
+            .where("id", companyId)
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
     });
 }
 
-async function addCategory(name, pool) {
-    const result = await pool.query(
-        `INSERT INTO bank_categories (name)
-         VALUES ($1)
-         RETURNING id, name`,
-        [normalizeName(name, "Category name")]
-    );
-    return { id: Number(result.rows[0].id), name: result.rows[0].name };
+async function addCategory(name, dbOrPool) {
+    const catName = normalizeName(name, "Category name");
+    const k = getKnex(dbOrPool);
+
+    const [row] = await k("bank_categories")
+        .insert({
+            name: catName,
+            active: 1
+        })
+        .returning(["id", "name"]);
+
+    return { id: Number(row.id), name: row.name };
 }
 
-async function updateCategory(id, name, pool) {
+async function updateCategory(id, name, dbOrPool) {
     const categoryId = normalizeId(id);
     const categoryName = normalizeName(name, "Category name");
 
-    return inTransaction(pool, async client => {
-        const current = await client.query(
-            `SELECT name
-             FROM bank_categories
-             WHERE id = $1 AND active = 1
-             FOR UPDATE`,
-            [categoryId]
-        );
-        if (current.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const current = await trx("bank_categories")
+            .select("name")
+            .where("id", categoryId)
+            .where("active", 1)
+            .forUpdate()
+            .first();
+
+        if (!current) {
             throw new MasterDataNotFoundError("Category was not found.");
         }
 
-        const oldName = current.rows[0].name;
-        const updated = await client.query(
-            `UPDATE bank_categories
-             SET name = $2, updated_at = NOW()
-             WHERE id = $1
-             RETURNING id, name`,
-            [categoryId, categoryName]
-        );
-        await client.query(
-            `UPDATE company_bank_mappings
-             SET cat = $2, updated_at = NOW()
-             WHERE LOWER(TRIM(cat)) = LOWER(TRIM($1))`,
-            [oldName, categoryName]
-        );
-        return { id: Number(updated.rows[0].id), name: updated.rows[0].name };
+        const oldName = current.name;
+        const [updated] = await trx("bank_categories")
+            .where("id", categoryId)
+            .update({
+                name: categoryName,
+                updated_at: trx.fn.now()
+            })
+            .returning(["id", "name"]);
+
+        await trx("company_bank_mappings")
+            .whereRaw("LOWER(TRIM(cat)) = LOWER(TRIM(?))", [oldName])
+            .update({
+                cat: categoryName,
+                updated_at: trx.fn.now()
+            });
+
+        return { id: Number(updated.id), name: updated.name };
     });
 }
 
-async function deleteCategory(id, pool) {
+async function deleteCategory(id, dbOrPool) {
     const categoryId = normalizeId(id);
 
-    return inTransaction(pool, async client => {
-        const current = await client.query(
-            `SELECT name
-             FROM bank_categories
-             WHERE id = $1 AND active = 1
-             FOR UPDATE`,
-            [categoryId]
-        );
-        if (current.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const current = await trx("bank_categories")
+            .select("name")
+            .where("id", categoryId)
+            .where("active", 1)
+            .forUpdate()
+            .first();
+
+        if (!current) {
             throw new MasterDataNotFoundError("Category was not found.");
         }
 
-        await client.query(
-            `UPDATE company_bank_mappings
-             SET cat = NULL, updated_at = NOW()
-             WHERE LOWER(TRIM(cat)) = LOWER(TRIM($1))`,
-            [current.rows[0].name]
-        );
-        await client.query(
-            `UPDATE bank_categories
-             SET active = 0, updated_at = NOW()
-             WHERE id = $1`,
-            [categoryId]
-        );
+        await trx("company_bank_mappings")
+            .whereRaw("LOWER(TRIM(cat)) = LOWER(TRIM(?))", [current.name])
+            .update({
+                cat: null,
+                updated_at: trx.fn.now()
+            });
+
+        await trx("bank_categories")
+            .where("id", categoryId)
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
     });
 }
 
-async function listBanks(pool) {
-    if (!pool) {
+async function listBanks(dbOrPool) {
+    const k = getKnex(dbOrPool);
+    if (!k) {
         return [
             { id: 1, name: "Axis Bank", company_count: 0, bre_rule_count: 0 },
             { id: 2, name: "Bank of Baroda", company_count: 0, bre_rule_count: 0 },
@@ -562,43 +619,52 @@ async function listBanks(pool) {
         ];
     }
 
-    await pool.query(`
-        INSERT INTO managed_banks (bank_name)
-        SELECT DISTINCT TRIM(bank_name)
-        FROM (
-            SELECT bank_name FROM company_bank_mappings WHERE active = 1 AND TRIM(bank_name) <> ''
-            UNION
-            SELECT bank_name FROM bre_rules WHERE active = 1 AND TRIM(bank_name) <> ''
-        ) distinct_banks
-        ON CONFLICT (LOWER(TRIM(bank_name))) WHERE active = 1 DO NOTHING
-    `).catch(() => { });
+    try {
+        await k.raw(`
+            INSERT INTO managed_banks (bank_name)
+            SELECT DISTINCT TRIM(bank_name)
+            FROM (
+                SELECT bank_name FROM company_bank_mappings WHERE active = 1 AND TRIM(bank_name) <> ''
+                UNION
+                SELECT bank_name FROM bre_rules WHERE active = 1 AND TRIM(bank_name) <> ''
+            ) distinct_banks
+            ON CONFLICT (LOWER(TRIM(bank_name))) WHERE active = 1 DO NOTHING
+        `);
+    } catch (_e) { }
 
-    const result = await pool.query(`
-        SELECT 
-            mb.id,
-            mb.bank_name AS name,
-            COALESCE(c.comp_count, 0)::int AS company_count,
-            COALESCE(r.bre_count, 0)::int AS bre_rule_count
-        FROM managed_banks mb
-        LEFT JOIN (
-            SELECT LOWER(TRIM(bank_name)) AS bname, COUNT(*) AS comp_count
-            FROM company_bank_mappings
-            WHERE active = 1
-            GROUP BY LOWER(TRIM(bank_name))
-        ) c ON LOWER(TRIM(mb.bank_name)) = c.bname
-        LEFT JOIN (
-            SELECT LOWER(TRIM(bank_name)) AS bname, COUNT(*) AS bre_count
-            FROM bre_rules
-            WHERE active = 1
-            GROUP BY LOWER(TRIM(bank_name))
-        ) r ON LOWER(TRIM(mb.bank_name)) = r.bname 
-            OR LOWER(TRIM(mb.bank_name)) = REPLACE(r.bname, ' bank', '') 
-            OR LOWER(TRIM(mb.bank_name)) || ' bank' = r.bname
-        WHERE mb.active = 1
-        ORDER BY mb.bank_name ASC
-    `);
+    const compSubquery = k("company_bank_mappings")
+        .select(k.raw("LOWER(TRIM(bank_name)) as bname"))
+        .count("* as comp_count")
+        .where("active", 1)
+        .groupByRaw("LOWER(TRIM(bank_name))")
+        .as("c");
 
-    return result.rows.map(row => ({
+    const breSubquery = k("bre_rules")
+        .select(k.raw("LOWER(TRIM(bank_name)) as bname"))
+        .count("* as bre_count")
+        .where("active", 1)
+        .groupByRaw("LOWER(TRIM(bank_name))")
+        .as("r");
+
+    const rows = await k("managed_banks as mb")
+        .select(
+            "mb.id",
+            "mb.bank_name as name",
+            k.raw("COALESCE(c.comp_count, 0)::int as company_count"),
+            k.raw("COALESCE(r.bre_count, 0)::int as bre_rule_count")
+        )
+        .leftJoin(compSubquery, function () {
+            this.on(k.raw("LOWER(TRIM(mb.bank_name))"), "=", "c.bname");
+        })
+        .leftJoin(breSubquery, function () {
+            this.on(k.raw("LOWER(TRIM(mb.bank_name))"), "=", "r.bname")
+                .orOn(k.raw("LOWER(TRIM(mb.bank_name))"), "=", k.raw("REPLACE(r.bname, ' bank', '')"))
+                .orOn(k.raw("LOWER(TRIM(mb.bank_name)) || ' bank'"), "=", "r.bname");
+        })
+        .where("mb.active", 1)
+        .orderBy("mb.bank_name", "asc");
+
+    return rows.map((row) => ({
         id: Number(row.id),
         name: row.name,
         company_count: Number(row.company_count || 0),
@@ -606,21 +672,24 @@ async function listBanks(pool) {
     }));
 }
 
-async function addBank(name, pool) {
+async function addBank(name, dbOrPool) {
     const bankName = normalizeName(name, "Bank name");
-    if (!pool) {
+    const k = getKnex(dbOrPool);
+    if (!k) {
         return { id: 99, name: bankName };
     }
-    const result = await pool.query(
-        `INSERT INTO managed_banks (bank_name)
-         VALUES ($1)
-         RETURNING id, bank_name AS name`,
-        [bankName]
-    );
-    return { id: Number(result.rows[0].id), name: result.rows[0].name };
+
+    const [row] = await k("managed_banks")
+        .insert({
+            bank_name: bankName,
+            active: 1
+        })
+        .returning(["id", "bank_name as name"]);
+
+    return { id: Number(row.id), name: row.name };
 }
 
-async function updateBank(id, input, pool) {
+async function updateBank(id, input, dbOrPool) {
     const bankId = normalizeId(id);
     const bankName = typeof input === "object" && input !== null
         ? normalizeName(input.name, "Bank name")
@@ -634,134 +703,146 @@ async function updateBank(id, input, pool) {
         ? normalizePercentage(input.cc_obligation_percent, "CC obligation percentage")
         : null;
 
-    return inTransaction(pool, async client => {
-        const current = await client.query(
-            `SELECT bank_name
-             FROM managed_banks
-             WHERE id = $1 AND active = 1
-             FOR UPDATE`,
-            [bankId]
-        );
-        if (current.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const current = await trx("managed_banks")
+            .select("bank_name")
+            .where("id", bankId)
+            .where("active", 1)
+            .forUpdate()
+            .first();
+
+        if (!current) {
             throw new MasterDataNotFoundError("Bank was not found.");
         }
 
-        const oldName = current.rows[0].bank_name;
-
+        const oldName = current.bank_name;
         if (oldName.toLowerCase().trim() !== bankName.toLowerCase().trim()) {
-            const dup = await client.query(
-                `SELECT id FROM managed_banks WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1)) AND id != $2 AND active = 1`,
-                [bankName, bankId]
-            );
-            if (dup.rowCount > 0) {
+            const dup = await trx("managed_banks")
+                .select("id")
+                .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                .where("id", "!=", bankId)
+                .where("active", 1)
+                .first();
+
+            if (dup) {
                 throw new InvalidMasterDataInputError(`A bank named "${bankName}" already exists.`);
             }
         }
 
-        const updated = await client.query(
-            `UPDATE managed_banks
-             SET bank_name = $2, updated_at = NOW()
-             WHERE id = $1
-             RETURNING id, bank_name AS name`,
-            [bankId, bankName]
-        );
+        const [updated] = await trx("managed_banks")
+            .where("id", bankId)
+            .update({
+                bank_name: bankName,
+                updated_at: trx.fn.now()
+            })
+            .returning(["id", "bank_name as name"]);
 
-        let mappingQuery = `
-            UPDATE company_bank_mappings
-            SET bank_name = $2, updated_at = NOW()
-        `;
-        const mappingParams = [oldName, bankName];
-
+        const updateData = {
+            bank_name: bankName,
+            updated_at: trx.fn.now()
+        };
         if (foir !== null) {
-            mappingParams.push(foir);
-            mappingQuery += `, foir = $${mappingParams.length}`;
+            updateData.foir = foir;
         }
         if (ccObligation !== null) {
-            mappingParams.push(ccObligation);
-            mappingQuery += `, cc_obligation_percent = $${mappingParams.length}`;
+            updateData.cc_obligation_percent = ccObligation;
         }
 
-        mappingQuery += ` WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1)) AND active = 1`;
-        await client.query(mappingQuery, mappingParams);
+        await trx("company_bank_mappings")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [oldName])
+            .where("active", 1)
+            .update(updateData);
 
-        await client.query(
-            `UPDATE bank_employer_catalog
-             SET bank_name = $2, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1)) AND active = 1`,
-            [oldName, bankName]
-        ).catch(() => { });
+        await trx("bank_employer_catalog")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [oldName])
+            .where("active", 1)
+            .update({
+                bank_name: bankName,
+                updated_at: trx.fn.now()
+            })
+            .catch(() => { });
 
-        await client.query(
-            `UPDATE bank_policy_matrix
-             SET bank_name = $2, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1)) AND active = 1`,
-            [oldName, bankName]
-        ).catch(() => { });
+        await trx("bank_policy_matrix")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [oldName])
+            .where("active", 1)
+            .update({
+                bank_name: bankName,
+                updated_at: trx.fn.now()
+            })
+            .catch(() => { });
 
-        await client.query(
-            `UPDATE bre_rules
-             SET bank_name = $2, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1))`,
-            [oldName, bankName]
-        ).catch(() => { });
+        await trx("bre_rules")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [oldName])
+            .update({
+                bank_name: bankName,
+                updated_at: trx.fn.now()
+            })
+            .catch(() => { });
 
         return {
-            id: Number(updated.rows[0].id),
-            name: updated.rows[0].name,
+            id: Number(updated.id),
+            name: updated.name,
             foir,
             cc_obligation_percent: ccObligation
         };
     });
 }
 
-async function deleteBank(id, pool) {
+async function deleteBank(id, dbOrPool) {
     const bankId = normalizeId(id);
 
-    return inTransaction(pool, async client => {
-        const current = await client.query(
-            `SELECT bank_name
-             FROM managed_banks
-             WHERE id = $1 AND active = 1
-             FOR UPDATE`,
-            [bankId]
-        );
-        if (current.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const current = await trx("managed_banks")
+            .select("bank_name")
+            .where("id", bankId)
+            .where("active", 1)
+            .forUpdate()
+            .first();
+
+        if (!current) {
             throw new MasterDataNotFoundError("Bank was not found.");
         }
 
-        const bankName = current.rows[0].bank_name;
+        const bankName = current.bank_name;
 
-        await client.query(
-            `UPDATE company_bank_mappings
-             SET active = 0, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1))
-             AND active = 1`,
-            [bankName]
-        );
-        await client.query(
-            `UPDATE managed_banks
-             SET active = 0, updated_at = NOW()
-             WHERE id = $1`,
-            [bankId]
-        );
-        await client.query(
-            `UPDATE bank_employer_catalog
-             SET active = 0, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1))`,
-            [bankName]
-        ).catch(() => { });
-        await client.query(
-            `UPDATE bank_policy_matrix
-             SET active = 0, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1))`,
-            [bankName]
-        ).catch(() => { });
-        await client.query(
-            `UPDATE bre_rules
-             SET active = 0, updated_at = NOW()
-             WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1))`,
-            [bankName]
-        ).catch(() => { });
+        await trx("company_bank_mappings")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+            .where("active", 1)
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
+
+        await trx("managed_banks")
+            .where("id", bankId)
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
+
+        await trx("bank_employer_catalog")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            })
+            .catch(() => { });
+
+        await trx("bank_policy_matrix")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            })
+            .catch(() => { });
+
+        await trx("bre_rules")
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            })
+            .catch(() => { });
     });
 }
 
@@ -798,96 +879,79 @@ function findMatchingBreSlabs(companyCat, slabsByCat, isIcici, universalSlabs) {
     return [];
 }
 
-async function listBankMappings(bankIdentifier, pool, options = {}) {
+async function listBankMappings(bankIdentifier, dbOrPool, options = {}) {
     if (!bankIdentifier) return [];
-    if (!pool) {
+    const k = getKnex(dbOrPool);
+    if (!k) {
         return [];
     }
+
     let bankName = String(bankIdentifier).trim();
     if (/^\d+$/.test(bankName)) {
-        const bankRes = await pool.query(
-            `SELECT bank_name FROM managed_banks WHERE id = $1 AND active = 1`,
-            [Number(bankName)]
-        );
-        if (bankRes.rowCount > 0) {
-            bankName = bankRes.rows[0].bank_name;
+        const bankRes = await k("managed_banks")
+            .select("bank_name")
+            .where("id", Number(bankName))
+            .where("active", 1)
+            .first();
+
+        if (bankRes) {
+            bankName = bankRes.bank_name;
         }
     }
 
-    const search = options.search ? `%${options.search.trim()}%` : null;
+    const search = options.search ? options.search.trim() : null;
     const limit = options.limit ? Number(options.limit) : null;
     const offset = options.offset ? Number(options.offset) : 0;
     const bankClean = bankName.toLowerCase().replace(/\s+bank$/i, "").trim();
 
-    let query = `
-        SELECT id, company_name, bank_name, cat, foir, cc_obligation_percent
-        FROM company_bank_mappings
-        WHERE active = 1
-          AND (
-              LOWER(TRIM(bank_name)) = LOWER(TRIM($1))
-              OR LOWER(TRIM(bank_name)) = LOWER(TRIM($2))
-              OR LOWER(TRIM(bank_name)) LIKE $3
-              OR LOWER($1) LIKE '%' || LOWER(TRIM(bank_name)) || '%'
-          )
-    `;
-    const params = [bankName, bankClean, `%${bankClean}%`];
+    const bankMatchClause = function (builder) {
+        builder
+            .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+            .orWhereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankClean])
+            .orWhereILike("bank_name", `%${bankClean}%`)
+            .orWhereRaw("LOWER(?) LIKE '%' || LOWER(TRIM(bank_name)) || '%'", [bankName]);
+    };
+
+    let qb = k("company_bank_mappings")
+        .select("id", "company_name", "bank_name", "cat", "foir", "cc_obligation_percent")
+        .where("active", 1)
+        .where(bankMatchClause);
+
+    let countQb = k("company_bank_mappings")
+        .count("* as total")
+        .where("active", 1)
+        .where(bankMatchClause);
+
     if (search) {
-        params.push(search);
-        query += ` AND company_name ILIKE $${params.length}`;
+        qb = qb.whereILike("company_name", `%${search}%`);
+        countQb = countQb.whereILike("company_name", `%${search}%`);
     }
-    query += ` ORDER BY company_name ASC, cat ASC`;
+
+    qb = qb.orderBy("company_name", "asc").orderBy("cat", "asc");
+
     if (limit && Number.isInteger(limit) && limit > 0) {
-        params.push(limit);
-        query += ` LIMIT $${params.length}`;
+        qb = qb.limit(limit);
         if (offset && Number.isInteger(offset) && offset > 0) {
-            params.push(offset);
-            query += ` OFFSET $${params.length}`;
+            qb = qb.offset(offset);
         }
     }
 
-    let countQuery = `
-        SELECT count(*) AS total
-        FROM company_bank_mappings
-        WHERE active = 1
-          AND (
-              LOWER(TRIM(bank_name)) = LOWER(TRIM($1))
-              OR LOWER(TRIM(bank_name)) = LOWER(TRIM($2))
-              OR LOWER(TRIM(bank_name)) LIKE $3
-              OR LOWER($1) LIKE '%' || LOWER(TRIM(bank_name)) || '%'
-          )
-    `;
-    const countParams = [bankName, bankClean, `%${bankClean}%`];
-    if (search) {
-        countParams.push(search);
-        countQuery += ` AND company_name ILIKE $${countParams.length}`;
-    }
-
-    const [result, countRes] = await Promise.all([
-        pool.query(query, params),
-        pool.query(countQuery, countParams)
+    const [rows, countRow] = await Promise.all([
+        qb,
+        countQb.first()
     ]);
-    const totalRecords = Number(countRes.rows[0]?.total || 0);
+    const totalRecords = Number(countRow?.total || 0);
 
     // Fetch active BRE rules for this bank to enrich mappings with live BRE FOIR slabs
     let breRules = [];
     try {
-        const breRes = await pool.query(
-            `SELECT id, category, rule_name, condition_type, min_salary, max_salary, foir_percent
-             FROM bre_rules
-             WHERE active = 1
-               AND (
-                   LOWER(TRIM(bank_name)) = LOWER(TRIM($1))
-                   OR LOWER(TRIM(bank_name)) = LOWER(TRIM($2))
-                   OR LOWER(TRIM(bank_name)) LIKE $3
-                   OR LOWER($1) LIKE '%' || LOWER(TRIM(bank_name)) || '%'
-               )
-             ORDER BY category ASC, min_salary ASC`,
-            [bankName, bankClean, `%${bankClean}%`]
-        );
-        breRules = breRes.rows;
-    } catch {
-        // Fallback safely if bre_rules table query is unavailable
-    }
+        breRules = await k("bre_rules")
+            .select("id", "category", "rule_name", "condition_type", "min_salary", "max_salary", "foir_percent")
+            .where("active", 1)
+            .where(bankMatchClause)
+            .orderBy("category", "asc")
+            .orderBy("min_salary", "asc");
+    } catch (_e) { }
 
     const slabsByCat = new Map();
     for (const rule of breRules) {
@@ -908,7 +972,7 @@ async function listBankMappings(bankIdentifier, pool, options = {}) {
     const isIcici = bankName.toLowerCase().includes("icici");
     const universalSlabs = slabsByCat.get("ALL") || [];
 
-    const mappings = result.rows.map(row => {
+    const mappings = rows.map((row) => {
         const matchedSlabs = findMatchingBreSlabs(row.cat, slabsByCat, isIcici, universalSlabs);
         const hasBre = Boolean(matchedSlabs && matchedSlabs.length > 0);
         let breMinFoir = null;
@@ -944,9 +1008,10 @@ async function listBankMappings(bankIdentifier, pool, options = {}) {
     };
 }
 
-async function addCompanyToBankMapping(bankIdentifier, values, pool) {
+async function addCompanyToBankMapping(bankIdentifier, values, dbOrPool) {
+    const k = getKnex(dbOrPool);
     let bankName = String(bankIdentifier).trim();
-    if (!pool) {
+    if (!k) {
         return {
             id: 1,
             company_name: values.company_name,
@@ -956,51 +1021,66 @@ async function addCompanyToBankMapping(bankIdentifier, values, pool) {
             cc_obligation_percent: Number(values.cc_obligation_percent ?? 5)
         };
     }
-    if (/^\d+$/.test(bankName)) {
-        const bankRes = await pool.query(
-            `SELECT bank_name FROM managed_banks WHERE id = $1 AND active = 1`,
-            [Number(bankName)]
-        );
-        if (bankRes.rowCount > 0) {
-            bankName = bankRes.rows[0].bank_name;
+
+    return inTransaction(dbOrPool, async (trx) => {
+        if (/^\d+$/.test(bankName)) {
+            const bankRes = await trx("managed_banks")
+                .select("bank_name")
+                .where("id", Number(bankName))
+                .where("active", 1)
+                .first();
+
+            if (bankRes) {
+                bankName = bankRes.bank_name;
+            }
         }
-    }
-    const normalizedBank = normalizeName(bankName, "Bank name");
-    const companyName = normalizeName(values.company_name, "Company name", { maxLength: 300 });
-    const category = values.cat == null || values.cat === ""
-        ? null
-        : normalizeName(values.cat, "Category");
-    const foir = normalizeFoir(values.foir);
-    const ccObligationPercent = normalizePercentage(
-        values.cc_obligation_percent,
-        "CC obligation percentage"
-    );
+        const normalizedBank = normalizeName(bankName, "Bank name");
+        const companyName = normalizeName(values.company_name, "Company name", { maxLength: 300 });
+        const category = values.cat == null || values.cat === ""
+            ? null
+            : normalizeName(values.cat, "Category");
+        const foir = normalizeFoir(values.foir);
+        const ccObligationPercent = normalizePercentage(
+            values.cc_obligation_percent,
+            "CC obligation percentage"
+        );
 
-    return inTransaction(pool, async client => {
-        await client.query(
-            `INSERT INTO managed_banks (bank_name, active)
-             VALUES ($1, 1)
-             ON CONFLICT (LOWER(TRIM(bank_name))) WHERE active = 1
-             DO NOTHING`,
-            [normalizedBank]
-        );
-        await client.query(
-            `INSERT INTO managed_companies (company_name, active)
-             VALUES ($1, 1)
-             ON CONFLICT (LOWER(TRIM(company_name))) WHERE active = 1
-             DO NOTHING`,
-            [companyName]
-        );
-        await ensureCategory(category, client);
+        await trx("managed_banks")
+            .insert({
+                bank_name: normalizedBank,
+                active: 1
+            })
+            .onConflict(trx.raw("(LOWER(TRIM(bank_name))) WHERE active = 1"))
+            .ignore();
 
-        const result = await client.query(
-            `INSERT INTO company_bank_mappings
-                (company_name, bank_name, cat, foir, cc_obligation_percent, active)
-             VALUES ($1, $2, $3, $4, $5, 1)
-             RETURNING id, company_name, bank_name, cat, foir, cc_obligation_percent`,
-            [companyName, normalizedBank, category, foir, ccObligationPercent]
-        );
-        const row = result.rows[0];
+        await trx("managed_companies")
+            .insert({
+                company_name: companyName,
+                active: 1
+            })
+            .onConflict(trx.raw("(LOWER(TRIM(company_name))) WHERE active = 1"))
+            .ignore();
+
+        await ensureCategory(category, trx);
+
+        const [row] = await trx("company_bank_mappings")
+            .insert({
+                company_name: companyName,
+                bank_name: normalizedBank,
+                cat: category,
+                foir: foir,
+                cc_obligation_percent: ccObligationPercent,
+                active: 1
+            })
+            .returning([
+                "id",
+                "company_name",
+                "bank_name",
+                "cat",
+                "foir",
+                "cc_obligation_percent"
+            ]);
+
         return {
             id: Number(row.id),
             company_name: row.company_name,
@@ -1012,7 +1092,7 @@ async function addCompanyToBankMapping(bankIdentifier, values, pool) {
     });
 }
 
-async function updateBankMappingById(mappingId, values, pool) {
+async function updateBankMappingById(mappingId, values, dbOrPool) {
     const id = normalizeId(mappingId);
     const companyName = normalizeName(values.company_name, "Company name", { maxLength: 300 });
     const category = values.cat == null || values.cat === ""
@@ -1024,28 +1104,40 @@ async function updateBankMappingById(mappingId, values, pool) {
         "CC obligation percentage"
     );
 
-    return inTransaction(pool, async client => {
-        await client.query(
-            `INSERT INTO managed_companies (company_name, active)
-             VALUES ($1, 1)
-             ON CONFLICT (LOWER(TRIM(company_name))) WHERE active = 1
-             DO NOTHING`,
-            [companyName]
-        );
-        await ensureCategory(category, client);
+    return inTransaction(dbOrPool, async (trx) => {
+        await trx("managed_companies")
+            .insert({
+                company_name: companyName,
+                active: 1
+            })
+            .onConflict(trx.raw("(LOWER(TRIM(company_name))) WHERE active = 1"))
+            .ignore();
 
-        const result = await client.query(
-            `UPDATE company_bank_mappings
-             SET company_name = $2, cat = $3, foir = $4,
-                 cc_obligation_percent = $5, updated_at = NOW()
-             WHERE id = $1 AND active = 1
-             RETURNING id, company_name, bank_name, cat, foir, cc_obligation_percent`,
-            [id, companyName, category, foir, ccObligationPercent]
-        );
-        if (result.rowCount === 0) {
+        await ensureCategory(category, trx);
+
+        const updated = await trx("company_bank_mappings")
+            .where("id", id)
+            .where("active", 1)
+            .update({
+                company_name: companyName,
+                cat: category,
+                foir: foir,
+                cc_obligation_percent: ccObligationPercent,
+                updated_at: trx.fn.now()
+            })
+            .returning([
+                "id",
+                "company_name",
+                "bank_name",
+                "cat",
+                "foir",
+                "cc_obligation_percent"
+            ]);
+
+        if (!updated || updated.length === 0) {
             throw new MasterDataNotFoundError("Bank mapping was not found.");
         }
-        const row = result.rows[0];
+        const row = updated[0];
         return {
             id: Number(row.id),
             company_name: row.company_name,
@@ -1057,23 +1149,24 @@ async function updateBankMappingById(mappingId, values, pool) {
     });
 }
 
-async function deleteBankMappingById(mappingId, pool) {
+async function deleteBankMappingById(mappingId, dbOrPool) {
     const id = normalizeId(mappingId);
-    return inTransaction(pool, async client => {
-        const result = await client.query(
-            `UPDATE company_bank_mappings
-             SET active = 0, updated_at = NOW()
-             WHERE id = $1 AND active = 1
-             RETURNING id`,
-            [id]
-        );
-        if (result.rowCount === 0) {
+    return inTransaction(dbOrPool, async (trx) => {
+        const count = await trx("company_bank_mappings")
+            .where("id", id)
+            .where("active", 1)
+            .update({
+                active: 0,
+                updated_at: trx.fn.now()
+            });
+
+        if (count === 0) {
             throw new MasterDataNotFoundError("Bank mapping was not found.");
         }
     });
 }
 
-async function bulkImportMappings(csvText, defaultBank, pool) {
+async function bulkImportMappings(csvText, defaultBank, dbOrPool) {
     if (!csvText || typeof csvText !== "string") {
         throw new InvalidMasterDataInputError("CSV content is required.");
     }
@@ -1123,7 +1216,8 @@ async function bulkImportMappings(csvText, defaultBank, pool) {
         });
     }
 
-    if (!pool) {
+    const k = getKnex(dbOrPool);
+    if (!k) {
         return {
             total: validatedRows.length,
             inserted: validatedRows.length,
@@ -1133,18 +1227,20 @@ async function bulkImportMappings(csvText, defaultBank, pool) {
         };
     }
 
-    return inTransaction(pool, async client => {
+    return inTransaction(dbOrPool, async (trx) => {
         let insertedCount = 0;
         let updatedCount = 0;
+        let unchangedCount = 0;
+        const changedSamples = [];
         const bankNames = new Set();
         const companyNames = new Set();
 
         // Bulk ensure all unique banks once before batch processing
         const allUniqueBanks = Array.from(new Set(validatedRows.map(r => r.bank_name).filter(Boolean)));
         if (allUniqueBanks.length > 0) {
-            await client.query(`
+            await trx.raw(`
                 INSERT INTO managed_banks (bank_name, active)
-                SELECT DISTINCT b, 1 FROM UNNEST($1::text[]) AS b
+                SELECT DISTINCT b, 1 FROM UNNEST(?::text[]) AS b
                 WHERE TRIM(b) <> ''
                 ON CONFLICT (LOWER(TRIM(bank_name))) WHERE active = 1 DO NOTHING
             `, [allUniqueBanks]);
@@ -1155,7 +1251,7 @@ async function bulkImportMappings(csvText, defaultBank, pool) {
             const chunk = validatedRows.slice(i, i + CHUNK_SIZE);
             const map = new Map();
             for (const item of chunk) {
-                const key = `${item.bank_name.toLowerCase().trim()}|${item.company_name.toLowerCase().trim()}|${(item.cat || "").toLowerCase().trim()}`;
+                const key = `${item.bank_name.toLowerCase().trim()}|${item.company_name.toLowerCase().trim()}`;
                 map.set(key, item);
             }
             const deduped = Array.from(map.values());
@@ -1166,22 +1262,66 @@ async function bulkImportMappings(csvText, defaultBank, pool) {
             const foirs = deduped.map(r => r.foir);
             const ccs = deduped.map(r => r.cc_obligation_percent);
 
+            // Query existing categories to accurately identify status/category changes
+            const existingRows = await trx("company_bank_mappings")
+                .select(
+                    trx.raw("LOWER(TRIM(company_name)) as c_name"),
+                    trx.raw("LOWER(TRIM(bank_name)) as b_name"),
+                    "cat"
+                )
+                .where("active", 1)
+                .whereRaw("LOWER(TRIM(company_name)) = ANY(?::text[])", [cNames.map(c => c.toLowerCase().trim())])
+                .whereRaw("LOWER(TRIM(bank_name)) = ANY(?::text[])", [bNames.map(b => b.toLowerCase().trim())]);
+
+            const existingMap = new Map();
+            for (const row of existingRows) {
+                existingMap.set(`${row.b_name}|${row.c_name}`, row.cat);
+            }
+
+            for (const item of deduped) {
+                const itemKey = `${item.bank_name.toLowerCase().trim()}|${item.company_name.toLowerCase().trim()}`;
+                if (existingMap.has(itemKey)) {
+                    const oldCat = existingMap.get(itemKey);
+                    const oldClean = (oldCat || "").trim().toUpperCase();
+                    const newClean = (item.cat || "").trim().toUpperCase();
+                    if (oldClean !== newClean) {
+                        updatedCount++;
+                        if (changedSamples.length < 50) {
+                            changedSamples.push({
+                                company: item.company_name,
+                                bank: item.bank_name,
+                                oldCategory: oldCat || "None",
+                                newCategory: item.cat || "None"
+                            });
+                        }
+                    } else {
+                        unchangedCount++;
+                    }
+                } else {
+                    insertedCount++;
+                }
+            }
+
             // Bulk ensure companies
-            await client.query(`
+            await trx.raw(`
                 INSERT INTO managed_companies (company_name, active)
-                SELECT DISTINCT c, 1 FROM UNNEST($1::text[]) AS c
+                SELECT DISTINCT c, 1 FROM UNNEST(?::text[]) AS c
                 WHERE TRIM(c) <> ''
                 ON CONFLICT (LOWER(TRIM(company_name))) WHERE active = 1 DO NOTHING
             `, [cNames]);
 
-            // Bulk insert/update company_bank_mappings
-            await client.query(`
-                INSERT INTO company_bank_mappings (company_name, bank_name, cat, foir, cc_obligation_percent, active)
-                SELECT comp, bnk, c, f, cc, 1
-                FROM UNNEST($1::text[], $2::text[], $3::text[], $4::numeric[], $5::numeric[]) AS t(comp, bnk, c, f, cc)
-                ON CONFLICT (LOWER(TRIM(company_name)), LOWER(TRIM(bank_name)), LOWER(TRIM(COALESCE(cat, ''))))
+            // Bulk in-place upsert on (company_name, bank_name)
+            await trx.raw(`
+                INSERT INTO company_bank_mappings (company_name, bank_name, cat, foir, cc_obligation_percent, active, updated_at)
+                SELECT comp, bnk, c, f, cc, 1, NOW()
+                FROM UNNEST(?::text[], ?::text[], ?::text[], ?::numeric[], ?::numeric[]) AS t(comp, bnk, c, f, cc)
+                ON CONFLICT (LOWER(TRIM(company_name)), LOWER(TRIM(bank_name)))
                 WHERE active = 1
-                DO UPDATE SET foir = EXCLUDED.foir, cc_obligation_percent = EXCLUDED.cc_obligation_percent, updated_at = NOW()
+                DO UPDATE SET 
+                    cat = EXCLUDED.cat,
+                    foir = EXCLUDED.foir, 
+                    cc_obligation_percent = EXCLUDED.cc_obligation_percent, 
+                    updated_at = NOW()
             `, [cNames, bNames, cats, foirs, ccs]);
 
             // Bulk insert into bank_employer_catalog
@@ -1191,16 +1331,15 @@ async function bulkImportMappings(csvText, defaultBank, pool) {
                 catMap.set(key, item);
             }
             const catDeduped = Array.from(catMap.values());
-            await client.query(`
-                INSERT INTO bank_employer_catalog (bank_name, employer_name, employer_category, active)
-                SELECT bnk, comp, COALESCE(c, 'CAT B'), 1
-                FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(bnk, comp, c)
+            await trx.raw(`
+                INSERT INTO bank_employer_catalog (bank_name, employer_name, employer_category, active, updated_at)
+                SELECT bnk, comp, COALESCE(c, 'CAT B'), 1, NOW()
+                FROM UNNEST(?::text[], ?::text[], ?::text[]) AS t(bnk, comp, c)
                 ON CONFLICT (LOWER(TRIM(bank_name)), LOWER(TRIM(employer_name)))
                 WHERE active = 1
                 DO UPDATE SET employer_category = EXCLUDED.employer_category, updated_at = NOW()
             `, [catDeduped.map(r => r.bank_name), catDeduped.map(r => r.company_name), catDeduped.map(r => r.cat)]);
 
-            insertedCount += deduped.length;
             for (const r of deduped) {
                 bankNames.add(r.bank_name);
                 companyNames.add(r.company_name);
@@ -1211,6 +1350,8 @@ async function bulkImportMappings(csvText, defaultBank, pool) {
             total: validatedRows.length,
             inserted: insertedCount,
             updated: updatedCount,
+            unchanged: unchangedCount,
+            changedSamples,
             banks: Array.from(bankNames),
             companies: Array.from(companyNames)
         };
@@ -1245,4 +1386,3 @@ module.exports = {
     updateCategory,
     deleteCategory
 };
-

@@ -3,9 +3,17 @@ import path from "path";
 import fs from "fs";
 
 // Load backend/.env first if present, then standard dotenv fallback
-const backendEnvPath = path.resolve(__dirname, "..", ".env");
-if (fs.existsSync(backendEnvPath)) {
-    dotenv.config({ path: backendEnvPath });
+const candidateEnvPaths = [
+    path.resolve(__dirname, "..", ".env"),
+    path.resolve(__dirname, "..", "..", ".env"),
+    path.resolve(process.cwd(), ".env"),
+    path.resolve(process.cwd(), "backend", ".env")
+];
+for (const p of candidateEnvPaths) {
+    if (fs.existsSync(p)) {
+        dotenv.config({ path: p });
+        break;
+    }
 }
 dotenv.config();
 

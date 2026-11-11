@@ -91,30 +91,29 @@ export async function ensureBreRulesTable(k: Knex = defaultDb): Promise<void> {
     }
 
     try {
-        await k.raw(`
-            UPDATE bre_rules
-            SET bank_name = 'ICICI'
-            WHERE LOWER(TRIM(bank_name)) = 'icici bank'
-              AND EXISTS (SELECT 1 FROM managed_banks WHERE LOWER(TRIM(bank_name)) = 'icici')
-        `);
-        await k.raw(`
-            UPDATE bre_rules
-            SET bank_name = 'HDFC'
-            WHERE LOWER(TRIM(bank_name)) = 'hdfc bank'
-              AND EXISTS (SELECT 1 FROM managed_banks WHERE LOWER(TRIM(bank_name)) = 'hdfc')
-        `);
-        await k.raw(`
-            UPDATE bre_rules
-            SET bank_name = 'Kotak Mahindra Bank'
-            WHERE LOWER(TRIM(bank_name)) IN ('kotak', 'kotak mahindra')
-              AND EXISTS (SELECT 1 FROM managed_banks WHERE LOWER(TRIM(bank_name)) = 'kotak mahindra bank')
-        `);
-        await k.raw(`
-            UPDATE bre_rules
-            SET bank_name = 'MUTHOOT FINANCE'
-            WHERE LOWER(TRIM(bank_name)) = 'muthoot fin'
-              AND EXISTS (SELECT 1 FROM managed_banks WHERE LOWER(TRIM(bank_name)) = 'muthoot finance')
-        `);
+        const banksToCheck = [
+            { target: "ICICI", oldName: "icici bank", managed: "icici" },
+            { target: "HDFC", oldName: "hdfc bank", managed: "hdfc" },
+            { target: "Kotak Mahindra Bank", oldNames: ["kotak", "kotak mahindra"], managed: "kotak mahindra bank" },
+            { target: "MUTHOOT FINANCE", oldName: "muthoot fin", managed: "muthoot finance" }
+        ];
+
+        for (const item of banksToCheck) {
+            const exists = await k("managed_banks")
+                .select("id")
+                .whereRaw("LOWER(TRIM(bank_name)) = ?", [item.managed])
+                .first();
+
+            if (exists) {
+                let qb = k("bre_rules");
+                if (item.oldNames) {
+                    qb = qb.whereRaw("LOWER(TRIM(bank_name)) = ANY(?::text[])", [item.oldNames]);
+                } else if (item.oldName) {
+                    qb = qb.whereRaw("LOWER(TRIM(bank_name)) = ?", [item.oldName]);
+                }
+                await qb.update({ bank_name: item.target });
+            }
+        }
     } catch {
         // Ignore
     }

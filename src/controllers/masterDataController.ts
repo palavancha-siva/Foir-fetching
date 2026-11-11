@@ -317,7 +317,7 @@ function createMasterDataController(state) {
                 );
                 return res.status(200).json({
                     success: true,
-                    message: `Successfully processed ${summary.total} mappings (${summary.inserted} added, ${summary.updated} updated) across ${summary.banks.length} banks.`,
+                    message: `Successfully processed ${summary.total} companies: ${summary.updated} category status updated, ${summary.inserted} newly added, ${summary.unchanged || 0} unchanged across ${summary.banks.length} bank(s).`,
                     summary
                 });
             });

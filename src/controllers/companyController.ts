@@ -7,6 +7,14 @@ const { resolveDynamicFoir } = require("../helpers/policyMatrix");
 const { resolveBreFoir } = require("../services/breService");
 const { lookupPincode, isBankServiceableForPincode } = require("../services/pincodeService");
 const { categoryMatches } = require("../utils/categoryMatcher");
+const { db: defaultDb } = require("../utils/dbUtil");
+
+function getKnex(dbOrPool) {
+    if (dbOrPool && typeof dbOrPool === "function" && typeof dbOrPool.select === "function") {
+        return dbOrPool;
+    }
+    return defaultDb;
+}
 
 function sortLendersByFoirDesc(a, b) {
     const foirA = Number(a && a.foir) || 0;
@@ -89,31 +97,31 @@ async function evaluateCatalogFreeLenders(companyName, salary, knownCategories =
     if (!pool || salary <= 0) return [];
 
     try {
+        const k = getKnex(pool);
         // Query lenders that have active BRE rules but NO company-specific catalog in company_bank_mappings (e.g. INCRID)
-        const q = `
-            SELECT DISTINCT b.bank_name
-            FROM bre_rules b
-            WHERE b.active = 1
-              AND LOWER(TRIM(b.bank_name)) != 'finnable'
-              AND NOT EXISTS (
-                  SELECT 1 FROM company_bank_mappings c
-                  WHERE LOWER(TRIM(c.bank_name)) = LOWER(TRIM(b.bank_name))
-                     OR LOWER(TRIM(c.bank_name)) = LOWER(TRIM(REPLACE(b.bank_name, ' BANK', '')))
-              )
-            ORDER BY b.bank_name ASC
-        `;
-        const res = await pool.query(q);
-        const catalogFreeBanks = res.rows.map(r => r.bank_name);
+        const rows = await k("bre_rules as b")
+            .distinct("b.bank_name")
+            .where("b.active", 1)
+            .whereRaw("LOWER(TRIM(b.bank_name)) != 'finnable'")
+            .whereNotExists(function() {
+                this.select(1)
+                    .from("company_bank_mappings as c")
+                    .whereRaw("LOWER(TRIM(c.bank_name)) = LOWER(TRIM(b.bank_name))")
+                    .orWhereRaw("LOWER(TRIM(c.bank_name)) = LOWER(TRIM(REPLACE(b.bank_name, ' BANK', '')))");
+            })
+            .orderBy("b.bank_name", "asc");
+
+        const catalogFreeBanks = rows.map(r => r.bank_name);
         if (catalogFreeBanks.length === 0) return [];
 
         const openLenders = [];
 
         for (const bankName of catalogFreeBanks) {
-            const catRes = await pool.query(
-                "SELECT DISTINCT category FROM bre_rules WHERE LOWER(TRIM(bank_name)) = LOWER(TRIM($1)) AND active = 1",
-                [bankName]
-            );
-            const bankCats = catRes.rows.map(r => r.category);
+            const catRows = await k("bre_rules")
+                .distinct("category")
+                .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [bankName])
+                .where("active", 1);
+            const bankCats = catRows.map(r => r.category);
 
             let targetCategory = null;
 
@@ -170,38 +178,6 @@ function createCompanyController(state) {
             if (search.length < 1) return res.json([]);
 
             const pool = state.getPool();
-            if (!pool) {
-                const demoCompanies = [
-                    { id: 1, name: "TCS" },
-                    { id: 2, name: "Infosys" },
-                    { id: 3, name: "Wipro" },
-                    { id: 4, name: "Accenture" },
-                    { id: 5, name: "Cognizant" },
-                    { id: 6, name: "Capgemini" },
-                    { id: 7, name: "Government" },
-                    { id: 8, name: "Amazon" },
-                    { id: 9, name: "Google" },
-                    { id: 10, name: "Microsoft" },
-                    { id: 11, name: "IBM" }
-                ];
-                const clean = search.toLowerCase();
-                const filtered = demoCompanies.filter(c => c.name.toLowerCase().includes(clean));
-                filtered.sort((a, b) => {
-                    const rank = (name) => {
-                        const n = name.toLowerCase();
-                        if (n === clean) return 1;
-                        if (n.startsWith(clean)) return 2;
-                        if (n.includes(` ${clean}`) || n.includes(`(${clean}`) || n.includes(`/${clean}`) || n.includes(`-${clean}`)) return 3;
-                        return 4;
-                    };
-                    const diff = rank(a.name) - rank(b.name);
-                    if (diff !== 0) return diff;
-                    if (a.name.length !== b.name.length) return a.name.length - b.name.length;
-                    return a.name.localeCompare(b.name);
-                });
-                return res.json(filtered);
-            }
-
             try {
                 return res.json(await companyService.searchCompanies(search, pool));
             } catch (error) {
@@ -215,13 +191,6 @@ function createCompanyController(state) {
 
         async categories(_req, res) {
             const pool = state.getPool();
-            if (!pool) {
-                return res.json([
-                    { id: 1, name: "CAT A" },
-                    { id: 2, name: "CAT B" }
-                ]);
-            }
-
             try {
                 return res.json(await companyService.listCategories("", pool));
             } catch (error) {
@@ -248,65 +217,6 @@ function createCompanyController(state) {
             }
 
             const pool = state.getPool();
-            if (!pool) {
-                const DEMO_MAPPINGS = {
-                    tcs: [
-                        { bank_name: "HDFC Bank", cat: "CAT A", foir: 75 },
-                        { bank_name: "ICICI Bank", cat: "CAT A", foir: 75 },
-                        { bank_name: "Axis Bank", cat: "CAT A", foir: 70 },
-                        { bank_name: "SBI", cat: "CAT A", foir: 70 },
-                        { bank_name: "Kotak Mahindra", cat: "CAT B", foir: 65 }
-                    ],
-                    infosys: [
-                        { bank_name: "HDFC Bank", cat: "CAT A", foir: 75 },
-                        { bank_name: "ICICI Bank", cat: "CAT A", foir: 75 },
-                        { bank_name: "Axis Bank", cat: "CAT A", foir: 70 },
-                        { bank_name: "SBI", cat: "CAT A", foir: 70 },
-                        { bank_name: "Kotak Mahindra", cat: "CAT B", foir: 65 }
-                    ],
-                    wipro: [
-                        { bank_name: "HDFC Bank", cat: "CAT A", foir: 70 },
-                        { bank_name: "ICICI Bank", cat: "CAT A", foir: 70 },
-                        { bank_name: "Axis Bank", cat: "CAT B", foir: 65 },
-                        { bank_name: "SBI", cat: "CAT A", foir: 68 },
-                        { bank_name: "Kotak Mahindra", cat: "CAT B", foir: 60 }
-                    ]
-                };
-
-                const found = DEMO_MAPPINGS[companyName.toLowerCase()] || [];
-                const demoList = found.map((m, idx) => {
-                    const dynamicMatrix = resolveDynamicFoir(m.cat, salary);
-                    return {
-                        id: idx + 1,
-                        company_name: companyName,
-                        bank_name: m.bank_name,
-                        cat: m.cat,
-                        foir: dynamicMatrix.foir,
-                        salary_slab: dynamicMatrix.salarySlab,
-                        cc_obligation_percent: 5
-                    };
-                });
-
-                const finnableDemo = await evaluateFinnableLender(companyName, salary, pincode, enquiries30d, null);
-                if (finnableDemo) {
-                    demoList.push(finnableDemo);
-                }
-
-                demoList.sort(sortLendersByFoirDesc);
-
-                if (demoList.length === 0) {
-                    return res.status(404).json({
-                        success: false,
-                        message: `No lender mappings found for company "${companyName}".`
-                    });
-                }
-
-                return res.json({
-                    success: true,
-                    company_name: companyName,
-                    mappings: demoList
-                });
-            }
 
             try {
                 const result = await companyService.getCompanyMappings(companyName, pool);
@@ -369,6 +279,24 @@ function createCompanyController(state) {
                             };
                         }
 
+                        // If the lender has active configured BRE rules for this specific category, but applicant did not qualify (e.g. salary < min threshold for category)
+                        if (pool && salary > 0) {
+                            try {
+                                const k = getKnex(pool);
+                                const bankRulesRes = await k("bre_rules")
+                                    .select("id", "rule_name", "category", "min_salary", "max_salary")
+                                    .where("active", 1)
+                                    .whereRaw("LOWER(TRIM(bank_name)) = LOWER(TRIM(?))", [row.bank_name]);
+                                if (bankRulesRes.length > 0) {
+                                    const matchingCatRules = bankRulesRes.filter(r => categoryMatches(row.cat, r.category));
+                                    if (matchingCatRules.length > 0) {
+                                        // Bank explicitly defines rules for this category, but applicant's salary is outside all defined slabs
+                                        return null;
+                                    }
+                                }
+                            } catch (_e) {}
+                        }
+
                         const dynamicMatrix = await getDynamicFoirFromDb(row.cat, salary, pool, row.bank_name);
                         return {
                             id: Number(row.id),
@@ -382,31 +310,32 @@ function createCompanyController(state) {
                     })
                 );
 
+                let finalMappings = mappingsWithFoir.filter(Boolean);
+
                 if (catalogFreeLenders && catalogFreeLenders.length > 0) {
                     for (const cfl of catalogFreeLenders) {
-                        const existingIdx = mappingsWithFoir.findIndex(m => m.bank_name.toLowerCase().trim() === cfl.bank_name.toLowerCase().trim());
+                        const existingIdx = finalMappings.findIndex(m => m.bank_name.toLowerCase().trim() === cfl.bank_name.toLowerCase().trim());
                         if (existingIdx >= 0) {
-                            mappingsWithFoir[existingIdx] = { ...mappingsWithFoir[existingIdx], ...cfl };
+                            finalMappings[existingIdx] = { ...finalMappings[existingIdx], ...cfl };
                         } else {
-                            mappingsWithFoir.push(cfl);
+                            finalMappings.push(cfl);
                         }
                     }
                 }
 
                 if (finnableLender) {
-                    const existingIndex = mappingsWithFoir.findIndex(m => m.bank_name.toLowerCase().includes("finnable"));
+                    const existingIndex = finalMappings.findIndex(m => m.bank_name.toLowerCase().includes("finnable"));
                     if (existingIndex >= 0) {
-                        mappingsWithFoir[existingIndex] = { ...mappingsWithFoir[existingIndex], ...finnableLender };
+                        finalMappings[existingIndex] = { ...finalMappings[existingIndex], ...finnableLender };
                     } else {
-                        mappingsWithFoir.push(finnableLender);
+                        finalMappings.push(finnableLender);
                     }
                 }
 
-                let finalMappings = mappingsWithFoir;
                 const cleanPin = String(pincode || "").trim().replace(/\D/g, "");
                 if (cleanPin.length === 6) {
                     const filtered = [];
-                    for (const m of mappingsWithFoir) {
+                    for (const m of finalMappings) {
                         if (m.is_finnable || (m.bank_name && m.bank_name.toUpperCase().includes("FINNABLE"))) {
                             filtered.push(m);
                             continue;
@@ -483,7 +412,7 @@ function createCompanyController(state) {
                     slabVal = breResult.rule_name;
                 } else {
                     const dynamicMatrix = await getDynamicFoirFromDb(row.cat, monthlyIncome, pool, row.bank_name);
-                    foirVal = dynamicMatrix.foir;
+                    foirVal = (row.foir && Number(row.foir) > 0) ? Number(row.foir) : dynamicMatrix.foir;
                     slabVal = dynamicMatrix.salarySlab;
                 }
 

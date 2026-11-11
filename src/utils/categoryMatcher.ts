@@ -31,8 +31,16 @@ export function extractCategoryTokens(raw: any): Set<string> {
         "CAT A": ["CATA", "CATEGORY A"],
         "CAT B": ["CATB", "CATEGORY B"],
         "CAT C": ["CATC", "CATEGORY C"],
-        "CAT D": ["CATD", "CATEGORY D"],
-        LLP: ["NON-CATEGORIZED", "UNLISTED"]
+        "CAT D": ["CATD", "CATEGORY D", "CATEGORY B & C", "TIER 2", "TIER 3 CITIES"],
+        "CAT E": ["CATE", "CATEGORY E", "CATEGORY B & C", "TIER 2", "TIER 3 CITIES"],
+        "CATE": ["CAT E", "CATEGORY E", "CATEGORY B & C", "TIER 2", "TIER 3 CITIES"],
+        DELIST: ["UNLISTED", "DELISTED", "NON-CATEGORIZED", "NON-LISTED", "CATEGORY C & UNLISTED"],
+        DELISTED: ["UNLISTED", "DELIST", "NON-CATEGORIZED", "NON-LISTED", "CATEGORY C & UNLISTED"],
+        UNLISTED: ["DELIST", "DELISTED", "NON-CATEGORIZED", "NON-LISTED"],
+        "NON-LISTED": ["UNLISTED", "DELIST", "DELISTED"],
+        "NON-CATEGORIZED": ["UNLISTED", "DELIST", "DELISTED"],
+        "NON-CAT": ["UNLISTED", "DELIST", "DELISTED"],
+        LLP: ["NON-CATEGORIZED", "UNLISTED", "DELIST"]
     };
 
     // Extract inside and outside parentheses

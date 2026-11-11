@@ -49,7 +49,7 @@ export async function calculateEligibility(input: any, pool: any) {
     );
 
     return calculateFoir({
-        income: input.income,
+        income: salary,
         annualRate: input.annualRate,
         months: input.months,
         loans: input.loans,
@@ -83,7 +83,7 @@ export async function calculateSingleEligibility(input: any, pool: any) {
             lender.salary_slab = breResult.rule_name;
         } else if (lender.cat) {
             const matrix = await getDynamicFoirFromDb(lender.cat, salary, pool, lender.bank_name);
-            lender.foir = matrix.foir;
+            lender.foir = (lender.foir && Number(lender.foir) > 0) ? Number(lender.foir) : matrix.foir;
             lender.salary_slab = matrix.salarySlab;
             lender.multiplier = matrix.multiplier;
         }
